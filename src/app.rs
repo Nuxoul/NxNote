@@ -504,7 +504,7 @@ impl NxNoteApp {
             let max_item_w = 180.0;
             egui::ScrollArea::vertical()
                 .id_salt("nx_notes_menu")
-                .max_height(260.0)
+                .max_height(150.0)
                 .show(ui, |ui| {
                     for n in &notes {
                         let display = truncate_to_fit(ui, n, max_item_w, note_font.clone());
@@ -541,6 +541,26 @@ impl NxNoteApp {
                     .clicked()
                 {
                     self.modal = Modal::TitleLearn { title: fg.title.clone() };
+                    ui.close_menu();
+                }
+                let fg_name = fg
+                    .exe_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let fg_path = fg.exe_path.to_string_lossy().to_string();
+                let already = self.cfg.blocked_apps.iter().any(|b| {
+                    let l = b.to_lowercase();
+                    l == fg_name.to_lowercase() || l == fg_path.to_lowercase()
+                });
+                if !already
+                    && menu_item(ui, icons::DELETE, &format!("拉黑「{fg_name}」"), false)
+                        .on_hover_text("加入应用黑名单（命中后落回速记本）")
+                        .clicked()
+                {
+                    self.cfg.blocked_apps.push(fg_name.clone());
+                    let _ = self.cfg.save();
                     ui.close_menu();
                 }
             }
@@ -650,19 +670,6 @@ impl NxNoteApp {
                 let theme_mode = self.cfg.theme_mode;
                 let base_size = self.cfg.font_size;
                 let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
-                    // 文件级 debug：写入 %TEMP%/nxnote_md_test.txt 一次，证明 layouter 被调用
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static LOGGED: AtomicBool = AtomicBool::new(false);
-                    if !LOGGED.swap(true, Ordering::Relaxed) {
-                        let _ = std::fs::write(
-                            std::env::temp_dir().join("nxnote_layouter.txt"),
-                            format!(
-                                "layouter ran! text_len={} wrap_width={}\n",
-                                text.len(),
-                                wrap_width
-                            ),
-                        );
-                    }
                     let styles = md_highlight::Styles {
                         p: palette(theme_mode),
                         base: base_size,
@@ -1024,23 +1031,51 @@ impl eframe::App for NxNoteApp {
 }
 
 /// 用 egui 真实字体度量做二分截断；对中英文混排都准确。
-/// 黑名单匹配：支持完整路径或裸文件名匹配，均不区分大小写
+/// 黑名单匹配：宽松匹配，支持完整路径 / 带扩展名文件 / 裸文件名 / 路径子串。
+/// 全部不区分大小写。
 fn app_blocked(blocked: &[String], exe: &std::path::Path) -> bool {
     if blocked.is_empty() {
         return false;
     }
-    let full = exe.to_string_lossy().to_lowercase();
-    let stem = exe
+    let full = exe.to_string_lossy().replace('/', "\\").to_lowercase();
+    let file_name = exe
         .file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
-    blocked.iter().any(|b| {
-        let b = b.trim().to_lowercase();
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    blocked.iter().any(|raw| {
+        let b = raw.trim().to_lowercase().replace('/', "\\");
         if b.is_empty() {
             return false;
         }
-        b == full || b == stem || full.ends_with(&b)
+        // 1) 用户输入的完整或末段路径
+        if full == b || full.ends_with(&format!("\\{b}")) {
+            return true;
+        }
+        // 2) 文件名（带扩展名）匹配
+        if file_name == b {
+            return true;
+        }
+        // 3) 裸名（不带扩展名）匹配
+        if stem == b {
+            return true;
+        }
+        // 4) 用户写了 xxx.exe 但实际 stem 是 xxx
+        if let Some(b_stem) = b.strip_suffix(".exe") {
+            if stem == b_stem {
+                return true;
+            }
+        }
+        // 5) 退化为子串匹配，但只对 >=3 字符的非通用关键词
+        if b.len() >= 3 && full.contains(&b) {
+            return true;
+        }
+        false
     })
 }
 

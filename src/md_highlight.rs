@@ -1,6 +1,16 @@
-//! 行级 + inline 双层扫描的 markdown live 高亮。
-//! 输出 LayoutJob：每段文本带自己的 TextFormat（字号/颜色/底色）。
-//! 关键：原始字符（# ** ` 等语法标记）保持可见，只是样式不同。
+//! 行级 + inline markdown live 高亮。
+//! 每段文本带自己的 TextFormat（字号/颜色/底色/下划线）。
+//! 原始字符（# ** ` 等语法标记）保持可见，只是样式不同。
+//!
+//! 样式定位（极强对比，避免"看起来没渲染"）：
+//! - heading: 大字号 + 鲜亮琥珀
+//! - inline code: 暖琥珀字 + 深巧克力色底
+//! - bold: 纯白（最亮）
+//! - italic: 斜体 + 浅琥珀
+//! - link: 青色 + 下划线
+//! - list marker: 鲜亮琥珀
+//! - quote: 引用斜体灰
+//! - hr: 暗色
 
 use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, Stroke, TextFormat};
@@ -13,47 +23,44 @@ pub struct Styles {
     pub base: f32,
 }
 
+const AMBER_BRIGHT: Color32 = Color32::from_rgb(245, 175, 90);
+const CODE_TEXT: Color32 = Color32::from_rgb(245, 180, 110);
+const CODE_BG: Color32 = Color32::from_rgb(52, 36, 22);
+const LINK_CYAN: Color32 = Color32::from_rgb(120, 200, 220);
+
 impl Styles {
-    fn fmt(&self, size: f32, color: Color32, family: FontFamily) -> TextFormat {
+    fn mono(&self, size: f32, color: Color32) -> TextFormat {
         TextFormat {
-            font_id: FontId::new(size, family),
+            font_id: FontId::new(size, FontFamily::Monospace),
             color,
             ..Default::default()
         }
     }
-    fn fmt_bg(&self, size: f32, color: Color32, bg: Color32, family: FontFamily) -> TextFormat {
+    fn prop(&self, size: f32, color: Color32) -> TextFormat {
         TextFormat {
-            font_id: FontId::new(size, family),
+            font_id: FontId::new(size, FontFamily::Proportional),
             color,
-            background: bg,
             ..Default::default()
         }
     }
 
     fn normal(&self) -> TextFormat {
-        // DEBUG: 临时改成粉色，确认 layouter 是否运行
-        self.fmt(
-            self.base,
-            egui::Color32::from_rgb(255, 100, 200),
-            FontFamily::Monospace,
-        )
+        self.mono(self.base, self.p.text)
     }
     fn syntax(&self) -> TextFormat {
-        // 语法标记：弱色
-        self.fmt(self.base, self.p.text_weak, FontFamily::Monospace)
+        self.mono(self.base, self.p.text_weak)
     }
     fn heading(&self, level: u8) -> (TextFormat, TextFormat) {
-        // 极其显眼：H1 2.0x、H2 1.6x，统一用 accent 色
         let scale = match level {
-            1 => 2.0,
-            2 => 1.6,
-            3 => 1.35,
-            4 => 1.2,
-            5 => 1.1,
-            _ => 1.05,
+            1 => 1.9,
+            2 => 1.55,
+            3 => 1.3,
+            4 => 1.15,
+            5 => 1.08,
+            _ => 1.04,
         };
         let size = self.base * scale;
-        let body = self.fmt(size, self.p.accent, FontFamily::Proportional);
+        let body = self.prop(size, AMBER_BRIGHT);
         let marker = TextFormat {
             font_id: FontId::new(size, FontFamily::Proportional),
             color: self.p.text_weak,
@@ -62,30 +69,28 @@ impl Styles {
         (marker, body)
     }
     fn code_inline(&self) -> TextFormat {
-        // 加强对比：明显的暗底 + 暖色文字
-        self.fmt_bg(
-            self.base,
-            egui::Color32::from_rgb(220, 170, 100),
-            egui::Color32::from_rgb(50, 42, 32),
-            FontFamily::Monospace,
-        )
+        TextFormat {
+            font_id: FontId::new(self.base, FontFamily::Monospace),
+            color: CODE_TEXT,
+            background: CODE_BG,
+            ..Default::default()
+        }
     }
     fn code_block(&self) -> TextFormat {
-        self.fmt_bg(
-            self.base,
-            egui::Color32::from_rgb(220, 215, 200),
-            egui::Color32::from_rgb(50, 42, 32),
-            FontFamily::Monospace,
-        )
+        TextFormat {
+            font_id: FontId::new(self.base, FontFamily::Monospace),
+            color: Color32::from_rgb(225, 220, 205),
+            background: CODE_BG,
+            ..Default::default()
+        }
     }
     fn bold(&self) -> TextFormat {
-        // 用纯白拉强对比
-        self.fmt(self.base, egui::Color32::WHITE, FontFamily::Monospace)
+        self.mono(self.base, Color32::WHITE)
     }
     fn italic(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: self.p.text,
+            color: AMBER_BRIGHT,
             italics: true,
             ..Default::default()
         }
@@ -93,8 +98,8 @@ impl Styles {
     fn link(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: self.p.accent,
-            underline: Stroke::new(1.0, self.p.accent),
+            color: LINK_CYAN,
+            underline: Stroke::new(1.0, LINK_CYAN),
             ..Default::default()
         }
     }
@@ -107,10 +112,10 @@ impl Styles {
         }
     }
     fn hr(&self) -> TextFormat {
-        self.fmt(self.base, self.p.stroke, FontFamily::Monospace)
+        self.mono(self.base, self.p.stroke)
     }
     fn list_marker(&self) -> TextFormat {
-        self.fmt(self.base, self.p.accent, FontFamily::Monospace)
+        self.mono(self.base, AMBER_BRIGHT)
     }
 }
 
@@ -118,19 +123,16 @@ pub fn build(text: &str, s: Styles) -> LayoutJob {
     let mut job = LayoutJob::default();
     let mut in_code_block = false;
 
-    // 空文本：至少 append 一个空段，确保 galley 有合理 metric
     if text.is_empty() {
         job.append("", 0.0, s.normal());
         return job;
     }
 
-    // 按 \n 分割，再分别 append 换行
     let lines: Vec<&str> = text.split('\n').collect();
     let last = lines.len() - 1;
     for (i, line) in lines.iter().enumerate() {
         process_line(&mut job, line, s, &mut in_code_block);
         if i < last {
-            // 段落间的 \n 用代码块色 / 普通色
             if in_code_block {
                 job.append("\n", 0.0, s.code_block());
             } else {
@@ -142,7 +144,6 @@ pub fn build(text: &str, s: Styles) -> LayoutJob {
 }
 
 fn process_line(job: &mut LayoutJob, line: &str, s: Styles, in_code_block: &mut bool) {
-    // 代码块界限
     if line.trim_start().starts_with("```") {
         *in_code_block = !*in_code_block;
         job.append(line, 0.0, s.syntax());
@@ -153,7 +154,6 @@ fn process_line(job: &mut LayoutJob, line: &str, s: Styles, in_code_block: &mut 
         return;
     }
 
-    // ATX 标题
     if let Some((level, prefix_len)) = atx_heading(line) {
         let (marker_fmt, body_fmt) = s.heading(level);
         job.append(&line[..prefix_len], 0.0, marker_fmt);
@@ -161,34 +161,29 @@ fn process_line(job: &mut LayoutJob, line: &str, s: Styles, in_code_block: &mut 
         return;
     }
 
-    // 水平分隔线
     if is_hr(line) {
         job.append(line, 0.0, s.hr());
         return;
     }
 
-    // 块引用
     if let Some(rest_idx) = blockquote_prefix(line) {
         job.append(&line[..rest_idx], 0.0, s.syntax());
         append_inline_with(job, &line[rest_idx..], s, s.quote());
         return;
     }
 
-    // 无序列表
     if let Some(marker_end) = unordered_list_marker(line) {
         job.append(&line[..marker_end], 0.0, s.list_marker());
         append_inline_with(job, &line[marker_end..], s, s.normal());
         return;
     }
 
-    // 有序列表
     if let Some(marker_end) = ordered_list_marker(line) {
         job.append(&line[..marker_end], 0.0, s.list_marker());
         append_inline_with(job, &line[marker_end..], s, s.normal());
         return;
     }
 
-    // 普通段落
     append_inline_with(job, line, s, s.normal());
 }
 
@@ -201,11 +196,14 @@ fn atx_heading(line: &str) -> Option<(u8, usize)> {
     if n == 0 {
         return None;
     }
+    // 接受 ASCII 空格或中文全角空格（U+3000，UTF-8 = E3 80 80）
     if b.get(n) == Some(&b' ') {
-        Some((n as u8, n + 1))
-    } else {
-        None
+        return Some((n as u8, n + 1));
     }
+    if b.get(n) == Some(&0xE3) && b.get(n + 1) == Some(&0x80) && b.get(n + 2) == Some(&0x80) {
+        return Some((n as u8, n + 3));
+    }
+    None
 }
 
 fn is_hr(line: &str) -> bool {
@@ -238,21 +236,25 @@ fn unordered_list_marker(line: &str) -> Option<usize> {
     while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
         i += 1;
     }
-    if i > 8 {
-        return None;
-    }
-    if i >= b.len() {
+    if i > 8 || i >= b.len() {
         return None;
     }
     let c = b[i];
     if !matches!(c, b'-' | b'*' | b'+') {
         return None;
     }
+    // ASCII 空格
     if b.get(i + 1) == Some(&b' ') {
-        Some(i + 2)
-    } else {
-        None
+        return Some(i + 2);
     }
+    // 中文全角空格 U+3000 (E3 80 80)
+    if b.get(i + 1) == Some(&0xE3)
+        && b.get(i + 2) == Some(&0x80)
+        && b.get(i + 3) == Some(&0x80)
+    {
+        return Some(i + 4);
+    }
+    None
 }
 
 fn ordered_list_marker(line: &str) -> Option<usize> {
@@ -274,14 +276,18 @@ fn ordered_list_marker(line: &str) -> Option<usize> {
     if b.get(i) != Some(&b'.') {
         return None;
     }
-    if b.get(i + 1) != Some(&b' ') {
-        return None;
+    if b.get(i + 1) == Some(&b' ') {
+        return Some(i + 2);
     }
-    Some(i + 2)
+    if b.get(i + 1) == Some(&0xE3)
+        && b.get(i + 2) == Some(&0x80)
+        && b.get(i + 3) == Some(&0x80)
+    {
+        return Some(i + 4);
+    }
+    None
 }
 
-/// 扫描 `code`, **bold**, *italic*, [text](url)。
-/// `default` 应用于未匹配到任何标记的纯文本片段。
 fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextFormat) {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -290,7 +296,6 @@ fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextF
     while i < bytes.len() {
         let c = bytes[i];
 
-        // `code`
         if c == b'`' {
             if let Some(end) = find_single_char_close(bytes, i + 1, b'`') {
                 flush(job, text, &mut buf_start, i, &default);
@@ -300,7 +305,6 @@ fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextF
                 continue;
             }
         }
-        // **bold**
         if c == b'*' && bytes.get(i + 1) == Some(&b'*') {
             if let Some(end) = find_double_star(bytes, i + 2) {
                 flush(job, text, &mut buf_start, i, &default);
@@ -314,7 +318,6 @@ fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextF
                 continue;
             }
         }
-        // *italic*  (单星，避免吃掉双星)
         if c == b'*'
             && bytes.get(i + 1) != Some(&b'*')
             && (i == 0 || bytes[i - 1] != b'*')
@@ -331,7 +334,6 @@ fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextF
                 }
             }
         }
-        // [text](url)
         if c == b'[' {
             if let Some((close_text, close_url)) = find_link(bytes, i) {
                 flush(job, text, &mut buf_start, i, &default);
