@@ -1,0 +1,39 @@
+[package]
+name = "nxnote"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+dirs = "5"
+global-hotkey = "0.6"
+sha1_smol = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+ttf-parser = "0.25"
+tray-icon = "0.19"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_Ime",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+panic = "abort"
