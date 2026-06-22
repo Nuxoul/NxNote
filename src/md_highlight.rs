@@ -24,8 +24,15 @@ const LINK_CYAN: Color32 = Color32::from_rgb(120, 200, 220);
 const QUOTE_COLOR: Color32 = Color32::from_rgb(140, 170, 200);
 const QUOTE_BAR: Color32 = Color32::from_rgb(110, 145, 180);
 
-fn faded(c: Color32) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 0)
+/// 隐藏 marker 时使用的极小字号 —— Galley 按字号算宽度，0.1pt 视觉上接近 0
+const HIDDEN_SIZE: f32 = 0.1;
+
+fn hidden_fmt(family: FontFamily) -> TextFormat {
+    TextFormat {
+        font_id: FontId::new(HIDDEN_SIZE, family),
+        color: Color32::TRANSPARENT,
+        ..Default::default()
+    }
 }
 
 impl Styles {
@@ -48,16 +55,22 @@ impl Styles {
         self.mono(self.base, self.p.text)
     }
     fn syntax(&self, visible: bool) -> TextFormat {
-        let c = self.p.text_weak;
-        self.mono(self.base, if visible { c } else { faded(c) })
+        if visible {
+            self.mono(self.base, self.p.text_weak)
+        } else {
+            hidden_fmt(FontFamily::Monospace)
+        }
     }
     fn heading_marker(&self, level: u8, visible: bool) -> TextFormat {
-        let size = self.base * heading_scale(level);
-        let c = self.p.text_weak;
-        TextFormat {
-            font_id: FontId::new(size, FontFamily::Proportional),
-            color: if visible { c } else { faded(c) },
-            ..Default::default()
+        if visible {
+            let size = self.base * heading_scale(level);
+            TextFormat {
+                font_id: FontId::new(size, FontFamily::Proportional),
+                color: self.p.text_weak,
+                ..Default::default()
+            }
+        } else {
+            hidden_fmt(FontFamily::Proportional)
         }
     }
     fn heading_body(&self, level: u8) -> TextFormat {
@@ -73,12 +86,16 @@ impl Styles {
         }
     }
     fn code_inline_marker(&self, visible: bool) -> TextFormat {
-        // 反引号也加上 CODE_BG 让背景连续，文本色按 visible 切
-        TextFormat {
-            font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: if visible { self.p.text_weak } else { Color32::TRANSPARENT },
-            background: CODE_BG,
-            ..Default::default()
+        if visible {
+            // 反引号也加上 CODE_BG 让背景连续
+            TextFormat {
+                font_id: FontId::new(self.base, FontFamily::Monospace),
+                color: self.p.text_weak,
+                background: CODE_BG,
+                ..Default::default()
+            }
+        } else {
+            hidden_fmt(FontFamily::Monospace)
         }
     }
     fn code_block(&self) -> TextFormat {
@@ -109,12 +126,14 @@ impl Styles {
         }
     }
     fn quote_marker(&self, visible: bool) -> TextFormat {
-        // > 用 QUOTE_BAR 色，弱化但永远不完全隐藏（保持引用辨识）
-        let c = QUOTE_BAR;
-        TextFormat {
-            font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: if visible { c } else { Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110) },
-            ..Default::default()
+        if visible {
+            TextFormat {
+                font_id: FontId::new(self.base, FontFamily::Monospace),
+                color: QUOTE_BAR,
+                ..Default::default()
+            }
+        } else {
+            hidden_fmt(FontFamily::Monospace)
         }
     }
     fn quote(&self) -> TextFormat {

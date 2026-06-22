@@ -296,6 +296,26 @@ impl NxNoteApp {
         }
     }
 
+    /// 每帧重检：黑名单变更后不需要等下次前台切换就能生效
+    fn enforce_blocklist(&mut self) {
+        if self.pinned {
+            return;
+        }
+        let Some(fg) = self.fg.clone() else {
+            return;
+        };
+        if !app_blocked(&self.cfg.blocked_apps, &fg.exe_path) {
+            return;
+        }
+        if self.folder_key != GLOBAL_FOLDER {
+            self.switch_to(
+                GLOBAL_FOLDER.to_string(),
+                "速记".to_string(),
+                SCRATCH_NOTE.to_string(),
+            );
+        }
+    }
+
     fn capture_hwnd(&mut self, frame: &eframe::Frame) {
         if self.hwnd_raw.is_some() {
             return;
@@ -571,6 +591,12 @@ impl NxNoteApp {
                             {
                                 self.cfg.blocked_apps.push(fg_name.clone());
                                 let _ = self.cfg.save();
+                                // 立刻切回速记本，不等下一次前台切换
+                                self.switch_to(
+                                    GLOBAL_FOLDER.to_string(),
+                                    "速记".to_string(),
+                                    SCRATCH_NOTE.to_string(),
+                                );
                                 ui.close_menu();
                             }
                         }
@@ -1022,6 +1048,7 @@ impl eframe::App for NxNoteApp {
         self.drain_foreground();
         self.drain_hotkey(ctx);
         self.drain_tray(ctx);
+        self.enforce_blocklist();
         self.autosave_tick();
         self.handle_keys(ctx);
         self.maybe_reapply_theme(ctx);
