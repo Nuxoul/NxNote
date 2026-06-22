@@ -57,6 +57,7 @@ pub struct NxNoteApp {
     title_first_frame: bool,
     title_pending_target: Option<bool>,
     title_pending_since: Option<Instant>,
+    editor_cursor_line: Option<usize>,
 
     settings_open: bool,
     settings_fonts_done: bool,
@@ -115,6 +116,7 @@ impl NxNoteApp {
             title_first_frame: true,
             title_pending_target: None,
             title_pending_since: None,
+            editor_cursor_line: None,
             settings_open: false,
             settings_fonts_done: false,
             settings_theme_done: false,
@@ -490,22 +492,24 @@ impl NxNoteApp {
         );
         let label = egui::RichText::new(truncated).size(13.0);
         ui.menu_button(label, |ui| {
-            ui.set_min_width(200.0);
-            ui.set_max_width(220.0);
+            ui.set_min_width(160.0);
+            ui.set_max_width(190.0);
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(egui::RichText::new("当前应用的笔记").weak().small());
-            let notes = self
-                .index
-                .apps
-                .get(&self.folder_key)
-                .map(|e| e.notes.clone())
-                .unwrap_or_else(|| vec![self.note_name.clone()]);
-            let note_font = egui::FontId::proportional(12.5);
-            let max_item_w = 180.0;
+
+            // 所有菜单项放进同一 ScrollArea，永不溢出屏幕
             egui::ScrollArea::vertical()
-                .id_salt("nx_notes_menu")
-                .max_height(150.0)
+                .id_salt("nx_menu")
+                .max_height(280.0)
                 .show(ui, |ui| {
+                    ui.label(egui::RichText::new("当前应用的笔记").weak().small());
+                    let notes = self
+                        .index
+                        .apps
+                        .get(&self.folder_key)
+                        .map(|e| e.notes.clone())
+                        .unwrap_or_else(|| vec![self.note_name.clone()]);
+                    let note_font = egui::FontId::proportional(12.5);
+                    let max_item_w = 150.0;
                     for n in &notes {
                         let display = truncate_to_fit(ui, n, max_item_w, note_font.clone());
                         if menu_item(ui, icons::DESCRIPTION, &display, n == &self.note_name)
@@ -517,57 +521,65 @@ impl NxNoteApp {
                             ui.close_menu();
                         }
                     }
+                    ui.separator();
+                    if menu_item(ui, icons::ADD, "新建笔记", false).clicked() {
+                        self.modal = Modal::NewNote { input: String::new() };
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, icons::EDIT, "重命名", false).clicked() {
+                        self.modal = Modal::Rename {
+                            input: self.note_name.clone(),
+                            old: self.note_name.clone(),
+                        };
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, icons::DELETE, "删除当前笔记", false).clicked() {
+                        self.delete_current_note();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if let Some(fg) = &self.fg {
+                        if menu_item(ui, icons::TARGET, "学习标题规则…", false)
+                            .on_hover_text("从窗口标题提取项目名")
+                            .clicked()
+                        {
+                            self.modal = Modal::TitleLearn { title: fg.title.clone() };
+                            ui.close_menu();
+                        }
+                        let fg_name = fg
+                            .exe_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let fg_path = fg.exe_path.to_string_lossy().to_string();
+                        let already = self.cfg.blocked_apps.iter().any(|b| {
+                            let l = b.to_lowercase();
+                            l == fg_name.to_lowercase() || l == fg_path.to_lowercase()
+                        });
+                        if !already {
+                            // 名字也要按宽度截断
+                            let pretty = truncate_to_fit(
+                                ui,
+                                &format!("拉黑「{fg_name}」"),
+                                150.0,
+                                egui::FontId::proportional(12.5),
+                            );
+                            if menu_item(ui, icons::DELETE, &pretty, false)
+                                .on_hover_text("加入应用黑名单（命中后落回速记本）")
+                                .clicked()
+                            {
+                                self.cfg.blocked_apps.push(fg_name.clone());
+                                let _ = self.cfg.save();
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                    if menu_item(ui, icons::FOLDER, "所有应用…", false).clicked() {
+                        self.modal = Modal::NotesList;
+                        ui.close_menu();
+                    }
                 });
-            ui.separator();
-            if menu_item(ui, icons::ADD, "新建笔记", false).clicked() {
-                self.modal = Modal::NewNote { input: String::new() };
-                ui.close_menu();
-            }
-            if menu_item(ui, icons::EDIT, "重命名", false).clicked() {
-                self.modal = Modal::Rename {
-                    input: self.note_name.clone(),
-                    old: self.note_name.clone(),
-                };
-                ui.close_menu();
-            }
-            if menu_item(ui, icons::DELETE, "删除当前笔记", false).clicked() {
-                self.delete_current_note();
-                ui.close_menu();
-            }
-            ui.separator();
-            if let Some(fg) = &self.fg {
-                if menu_item(ui, icons::TARGET, "学习标题规则…", false)
-                    .on_hover_text("从窗口标题提取项目名")
-                    .clicked()
-                {
-                    self.modal = Modal::TitleLearn { title: fg.title.clone() };
-                    ui.close_menu();
-                }
-                let fg_name = fg
-                    .exe_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-                let fg_path = fg.exe_path.to_string_lossy().to_string();
-                let already = self.cfg.blocked_apps.iter().any(|b| {
-                    let l = b.to_lowercase();
-                    l == fg_name.to_lowercase() || l == fg_path.to_lowercase()
-                });
-                if !already
-                    && menu_item(ui, icons::DELETE, &format!("拉黑「{fg_name}」"), false)
-                        .on_hover_text("加入应用黑名单（命中后落回速记本）")
-                        .clicked()
-                {
-                    self.cfg.blocked_apps.push(fg_name.clone());
-                    let _ = self.cfg.save();
-                    ui.close_menu();
-                }
-            }
-            if menu_item(ui, icons::FOLDER, "所有应用…", false).clicked() {
-                self.modal = Modal::NotesList;
-                ui.close_menu();
-            }
         });
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -669,10 +681,12 @@ impl NxNoteApp {
                 let editor_h = avail.y.max(60.0);
                 let theme_mode = self.cfg.theme_mode;
                 let base_size = self.cfg.font_size;
+                let cursor_line = self.editor_cursor_line;
                 let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
                     let styles = md_highlight::Styles {
                         p: palette(theme_mode),
                         base: base_size,
+                        cursor_line,
                     };
                     let mut job = md_highlight::build(text, styles);
                     job.wrap.max_width = wrap_width;
@@ -693,6 +707,8 @@ impl NxNoteApp {
 
                 if resp.has_focus() {
                     if let Some(range) = edit_output.cursor_range {
+                        // 给 layouter 下一帧用：当前光标所在段（=行）
+                        self.editor_cursor_line = Some(range.primary.pcursor.paragraph);
                         let crect = edit_output.galley.pos_from_cursor(&range.primary);
                         let x = edit_output.galley_pos.x + crect.left();
                         let y_top = edit_output.galley_pos.y + crect.top();

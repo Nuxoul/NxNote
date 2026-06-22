@@ -1,16 +1,9 @@
-//! 行级 + inline markdown live 高亮。
-//! 每段文本带自己的 TextFormat（字号/颜色/底色/下划线）。
-//! 原始字符（# ** ` 等语法标记）保持可见，只是样式不同。
-//!
-//! 样式定位（极强对比，避免"看起来没渲染"）：
-//! - heading: 大字号 + 鲜亮琥珀
-//! - inline code: 暖琥珀字 + 深巧克力色底
-//! - bold: 纯白（最亮）
-//! - italic: 斜体 + 浅琥珀
-//! - link: 青色 + 下划线
-//! - list marker: 鲜亮琥珀
-//! - quote: 引用斜体灰
-//! - hr: 暗色
+//! Typora 风格的 inline markdown live preview。
+//! - 不在光标行的 `# ** ` [ ]` 等语法标记 alpha=0 → 不可见但仍占位置
+//! - 光标移到该行才显示标记
+//! - 标记的可见性切换不引起内容重排（字号 / 宽度都保留）
+//! - 列表 marker `- ` `1. ` 始终可见（属于"内容感"，不是噪声）
+//! - blockquote `> ` 用 slate 蓝色，CJK 字体没斜体则颜色顶替
 
 use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, Stroke, TextFormat};
@@ -21,12 +14,19 @@ use crate::theme::Palette;
 pub struct Styles {
     pub p: Palette,
     pub base: f32,
+    pub cursor_line: Option<usize>,
 }
 
 const AMBER_BRIGHT: Color32 = Color32::from_rgb(245, 175, 90);
 const CODE_TEXT: Color32 = Color32::from_rgb(245, 180, 110);
 const CODE_BG: Color32 = Color32::from_rgb(52, 36, 22);
 const LINK_CYAN: Color32 = Color32::from_rgb(120, 200, 220);
+const QUOTE_COLOR: Color32 = Color32::from_rgb(140, 170, 200);
+const QUOTE_BAR: Color32 = Color32::from_rgb(110, 145, 180);
+
+fn faded(c: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 0)
+}
 
 impl Styles {
     fn mono(&self, size: f32, color: Color32) -> TextFormat {
@@ -47,31 +47,36 @@ impl Styles {
     fn normal(&self) -> TextFormat {
         self.mono(self.base, self.p.text)
     }
-    fn syntax(&self) -> TextFormat {
-        self.mono(self.base, self.p.text_weak)
+    fn syntax(&self, visible: bool) -> TextFormat {
+        let c = self.p.text_weak;
+        self.mono(self.base, if visible { c } else { faded(c) })
     }
-    fn heading(&self, level: u8) -> (TextFormat, TextFormat) {
-        let scale = match level {
-            1 => 1.9,
-            2 => 1.55,
-            3 => 1.3,
-            4 => 1.15,
-            5 => 1.08,
-            _ => 1.04,
-        };
-        let size = self.base * scale;
-        let body = self.prop(size, AMBER_BRIGHT);
-        let marker = TextFormat {
+    fn heading_marker(&self, level: u8, visible: bool) -> TextFormat {
+        let size = self.base * heading_scale(level);
+        let c = self.p.text_weak;
+        TextFormat {
             font_id: FontId::new(size, FontFamily::Proportional),
-            color: self.p.text_weak,
+            color: if visible { c } else { faded(c) },
             ..Default::default()
-        };
-        (marker, body)
+        }
     }
-    fn code_inline(&self) -> TextFormat {
+    fn heading_body(&self, level: u8) -> TextFormat {
+        let size = self.base * heading_scale(level);
+        self.prop(size, AMBER_BRIGHT)
+    }
+    fn code_inline_text(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
             color: CODE_TEXT,
+            background: CODE_BG,
+            ..Default::default()
+        }
+    }
+    fn code_inline_marker(&self, visible: bool) -> TextFormat {
+        // 反引号也加上 CODE_BG 让背景连续，文本色按 visible 切
+        TextFormat {
+            font_id: FontId::new(self.base, FontFamily::Monospace),
+            color: if visible { self.p.text_weak } else { Color32::TRANSPARENT },
             background: CODE_BG,
             ..Default::default()
         }
@@ -95,7 +100,7 @@ impl Styles {
             ..Default::default()
         }
     }
-    fn link(&self) -> TextFormat {
+    fn link_text(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
             color: LINK_CYAN,
@@ -103,19 +108,34 @@ impl Styles {
             ..Default::default()
         }
     }
-    fn quote(&self) -> TextFormat {
+    fn quote_marker(&self, visible: bool) -> TextFormat {
+        // > 用 QUOTE_BAR 色，弱化但永远不完全隐藏（保持引用辨识）
+        let c = QUOTE_BAR;
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: self.p.text_weak,
-            italics: true,
+            color: if visible { c } else { Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110) },
             ..Default::default()
         }
+    }
+    fn quote(&self) -> TextFormat {
+        self.mono(self.base, QUOTE_COLOR)
     }
     fn hr(&self) -> TextFormat {
         self.mono(self.base, self.p.stroke)
     }
     fn list_marker(&self) -> TextFormat {
         self.mono(self.base, AMBER_BRIGHT)
+    }
+}
+
+fn heading_scale(level: u8) -> f32 {
+    match level {
+        1 => 1.9,
+        2 => 1.55,
+        3 => 1.3,
+        4 => 1.15,
+        5 => 1.08,
+        _ => 1.04,
     }
 }
 
@@ -131,7 +151,8 @@ pub fn build(text: &str, s: Styles) -> LayoutJob {
     let lines: Vec<&str> = text.split('\n').collect();
     let last = lines.len() - 1;
     for (i, line) in lines.iter().enumerate() {
-        process_line(&mut job, line, s, &mut in_code_block);
+        let on_cursor = s.cursor_line == Some(i);
+        process_line(&mut job, line, on_cursor, s, &mut in_code_block);
         if i < last {
             if in_code_block {
                 job.append("\n", 0.0, s.code_block());
@@ -143,10 +164,10 @@ pub fn build(text: &str, s: Styles) -> LayoutJob {
     job
 }
 
-fn process_line(job: &mut LayoutJob, line: &str, s: Styles, in_code_block: &mut bool) {
+fn process_line(job: &mut LayoutJob, line: &str, on_cursor: bool, s: Styles, in_code_block: &mut bool) {
     if line.trim_start().starts_with("```") {
         *in_code_block = !*in_code_block;
-        job.append(line, 0.0, s.syntax());
+        job.append(line, 0.0, s.syntax(on_cursor));
         return;
     }
     if *in_code_block {
@@ -155,9 +176,10 @@ fn process_line(job: &mut LayoutJob, line: &str, s: Styles, in_code_block: &mut 
     }
 
     if let Some((level, prefix_len)) = atx_heading(line) {
-        let (marker_fmt, body_fmt) = s.heading(level);
-        job.append(&line[..prefix_len], 0.0, marker_fmt);
-        append_inline_with(job, &line[prefix_len..], s, body_fmt);
+        let marker = s.heading_marker(level, on_cursor);
+        let body = s.heading_body(level);
+        job.append(&line[..prefix_len], 0.0, marker);
+        append_inline_with(job, &line[prefix_len..], s, body, on_cursor);
         return;
     }
 
@@ -167,24 +189,25 @@ fn process_line(job: &mut LayoutJob, line: &str, s: Styles, in_code_block: &mut 
     }
 
     if let Some(rest_idx) = blockquote_prefix(line) {
-        job.append(&line[..rest_idx], 0.0, s.syntax());
-        append_inline_with(job, &line[rest_idx..], s, s.quote());
+        job.append(&line[..rest_idx], 0.0, s.quote_marker(on_cursor));
+        append_inline_with(job, &line[rest_idx..], s, s.quote(), on_cursor);
         return;
     }
 
     if let Some(marker_end) = unordered_list_marker(line) {
+        // 列表 marker 始终可见
         job.append(&line[..marker_end], 0.0, s.list_marker());
-        append_inline_with(job, &line[marker_end..], s, s.normal());
+        append_inline_with(job, &line[marker_end..], s, s.normal(), on_cursor);
         return;
     }
 
     if let Some(marker_end) = ordered_list_marker(line) {
         job.append(&line[..marker_end], 0.0, s.list_marker());
-        append_inline_with(job, &line[marker_end..], s, s.normal());
+        append_inline_with(job, &line[marker_end..], s, s.normal(), on_cursor);
         return;
     }
 
-    append_inline_with(job, line, s, s.normal());
+    append_inline_with(job, line, s, s.normal(), on_cursor);
 }
 
 fn atx_heading(line: &str) -> Option<(u8, usize)> {
@@ -196,7 +219,6 @@ fn atx_heading(line: &str) -> Option<(u8, usize)> {
     if n == 0 {
         return None;
     }
-    // 接受 ASCII 空格或中文全角空格（U+3000，UTF-8 = E3 80 80）
     if b.get(n) == Some(&b' ') {
         return Some((n as u8, n + 1));
     }
@@ -243,11 +265,9 @@ fn unordered_list_marker(line: &str) -> Option<usize> {
     if !matches!(c, b'-' | b'*' | b'+') {
         return None;
     }
-    // ASCII 空格
     if b.get(i + 1) == Some(&b' ') {
         return Some(i + 2);
     }
-    // 中文全角空格 U+3000 (E3 80 80)
     if b.get(i + 1) == Some(&0xE3)
         && b.get(i + 2) == Some(&0x80)
         && b.get(i + 3) == Some(&0x80)
@@ -288,7 +308,13 @@ fn ordered_list_marker(line: &str) -> Option<usize> {
     None
 }
 
-fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextFormat) {
+fn append_inline_with(
+    job: &mut LayoutJob,
+    text: &str,
+    s: Styles,
+    default: TextFormat,
+    on_cursor: bool,
+) {
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut buf_start = 0;
@@ -296,28 +322,35 @@ fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextF
     while i < bytes.len() {
         let c = bytes[i];
 
+        // `code`
         if c == b'`' {
             if let Some(end) = find_single_char_close(bytes, i + 1, b'`') {
                 flush(job, text, &mut buf_start, i, &default);
-                job.append(&text[i..=end], 0.0, s.code_inline());
+                job.append("`", 0.0, s.code_inline_marker(on_cursor));
+                if end > i + 1 {
+                    job.append(&text[i + 1..end], 0.0, s.code_inline_text());
+                }
+                job.append("`", 0.0, s.code_inline_marker(on_cursor));
                 i = end + 1;
                 buf_start = i;
                 continue;
             }
         }
+        // **bold**
         if c == b'*' && bytes.get(i + 1) == Some(&b'*') {
             if let Some(end) = find_double_star(bytes, i + 2) {
                 flush(job, text, &mut buf_start, i, &default);
-                job.append("**", 0.0, s.syntax());
+                job.append("**", 0.0, s.syntax(on_cursor));
                 if end > i + 2 {
                     job.append(&text[i + 2..end], 0.0, s.bold());
                 }
-                job.append("**", 0.0, s.syntax());
+                job.append("**", 0.0, s.syntax(on_cursor));
                 i = end + 2;
                 buf_start = i;
                 continue;
             }
         }
+        // *italic*
         if c == b'*'
             && bytes.get(i + 1) != Some(&b'*')
             && (i == 0 || bytes[i - 1] != b'*')
@@ -325,27 +358,28 @@ fn append_inline_with(job: &mut LayoutJob, text: &str, s: Styles, default: TextF
             if let Some(end) = find_single_star(bytes, i + 1) {
                 if end > i + 1 {
                     flush(job, text, &mut buf_start, i, &default);
-                    job.append("*", 0.0, s.syntax());
+                    job.append("*", 0.0, s.syntax(on_cursor));
                     job.append(&text[i + 1..end], 0.0, s.italic());
-                    job.append("*", 0.0, s.syntax());
+                    job.append("*", 0.0, s.syntax(on_cursor));
                     i = end + 1;
                     buf_start = i;
                     continue;
                 }
             }
         }
+        // [text](url)
         if c == b'[' {
             if let Some((close_text, close_url)) = find_link(bytes, i) {
                 flush(job, text, &mut buf_start, i, &default);
-                job.append("[", 0.0, s.syntax());
+                job.append("[", 0.0, s.syntax(on_cursor));
                 if close_text > i + 1 {
-                    job.append(&text[i + 1..close_text], 0.0, s.link());
+                    job.append(&text[i + 1..close_text], 0.0, s.link_text());
                 }
-                job.append("](", 0.0, s.syntax());
+                job.append("](", 0.0, s.syntax(on_cursor));
                 if close_url > close_text + 2 {
-                    job.append(&text[close_text + 2..close_url], 0.0, s.syntax());
+                    job.append(&text[close_text + 2..close_url], 0.0, s.syntax(on_cursor));
                 }
-                job.append(")", 0.0, s.syntax());
+                job.append(")", 0.0, s.syntax(on_cursor));
                 i = close_url + 1;
                 buf_start = i;
                 continue;
