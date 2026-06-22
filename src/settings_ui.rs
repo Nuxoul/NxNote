@@ -6,7 +6,7 @@ use crate::fonts;
 use crate::icons;
 use crate::theme::{palette, ThemeMode};
 
-pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config) {
+pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config, current_fg: Option<String>) {
     let p = palette(cfg.theme_mode);
 
     let frame = egui::Frame {
@@ -47,7 +47,7 @@ pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config) {
                 .max_rect(content_rect)
                 .layout(Layout::top_down(Align::LEFT)),
         );
-        draw_body(&mut content_ui, cfg);
+        draw_body(&mut content_ui, cfg, current_fg.as_deref());
 
         // Footer
         let footer_rect = Rect::from_min_max(
@@ -69,7 +69,7 @@ pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config) {
     });
 }
 
-fn draw_body(ui: &mut egui::Ui, cfg: &mut Config) {
+fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
     let p = palette(cfg.theme_mode);
 
     let total_w = ui.available_width();
@@ -198,12 +198,41 @@ fn draw_body(ui: &mut egui::Ui, cfg: &mut Config) {
                         .color(p.text_weak),
                 );
                 ui.add_space(4.0);
-                blocked_apps_picker(ui, &mut cfg.blocked_apps);
+                blocked_apps_picker(ui, &mut cfg.blocked_apps, current_fg, &p);
             });
         });
 }
 
-fn blocked_apps_picker(ui: &mut egui::Ui, value: &mut Vec<String>) {
+fn blocked_apps_picker(
+    ui: &mut egui::Ui,
+    value: &mut Vec<String>,
+    current_fg: Option<&str>,
+    p: &crate::theme::Palette,
+) {
+    // 当前前台 debug + 一键加黑
+    if let Some(fg) = current_fg {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("当前前台 exe（NxNote 实际看到的路径）：")
+                .small()
+                .color(p.text_weak),
+        );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(fg).small().color(p.text));
+        });
+        if ui
+            .button("把当前前台加入黑名单")
+            .on_hover_text("用 NxNote 实际看到的路径，避免手输出入")
+            .clicked()
+        {
+            let s = fg.to_string();
+            if !value.contains(&s) {
+                value.push(s);
+            }
+        }
+        ui.add_space(6.0);
+    }
+
     let mut to_remove: Option<usize> = None;
     for (i, item) in value.iter().enumerate() {
         ui.horizontal(|ui| {

@@ -58,6 +58,7 @@ pub struct NxNoteApp {
     title_pending_target: Option<bool>,
     title_pending_since: Option<Instant>,
     editor_cursor_line: Option<usize>,
+    last_editor_text_len: usize,
 
     settings_open: bool,
     settings_fonts_done: bool,
@@ -117,6 +118,7 @@ impl NxNoteApp {
             title_pending_target: None,
             title_pending_since: None,
             editor_cursor_line: None,
+            last_editor_text_len: 0,
             settings_open: false,
             settings_fonts_done: false,
             settings_theme_done: false,
@@ -718,7 +720,10 @@ impl NxNoteApp {
                     job.wrap.max_width = wrap_width;
                     ui.fonts(|f| f.layout_job(job))
                 };
+                let editor_id_salt = "nx_editor_main";
+                let editor_persistent_id = ui.make_persistent_id(editor_id_salt);
                 let edit_output = egui::TextEdit::multiline(&mut self.editor_text)
+                    .id_salt(editor_id_salt)
                     .desired_width(editor_w)
                     .min_size(egui::vec2(editor_w, editor_h))
                     .frame(false)
@@ -726,10 +731,69 @@ impl NxNoteApp {
                     .show(ui);
 
                 let resp = edit_output.response;
+                let new_len = self.editor_text.len();
+                let just_inserted_char = new_len == self.last_editor_text_len + 1;
                 if resp.changed() {
                     self.dirty = true;
                     self.last_edit = Some(Instant::now());
+
+                    // 自动续/退列表：当用户在列表行末尾按 Enter
+                    if just_inserted_char {
+                        if let Some(range) = edit_output.cursor_range {
+                            let cursor_char = range.primary.ccursor.index;
+                            let cursor_byte =
+                                byte_offset_from_char(&self.editor_text, cursor_char);
+                            if cursor_byte > 0
+                                && cursor_byte <= self.editor_text.len()
+                                && self.editor_text.as_bytes()[cursor_byte - 1] == b'\n'
+                            {
+                                let prev_line_end = cursor_byte - 1;
+                                let prev_line_start = self.editor_text[..prev_line_end]
+                                    .rfind('\n')
+                                    .map(|p| p + 1)
+                                    .unwrap_or(0);
+                                let prev_line = self.editor_text
+                                    [prev_line_start..prev_line_end]
+                                    .to_string();
+                                if let Some(cont) = continue_list_on_enter(&prev_line) {
+                                    match cont {
+                                        ListContinuation::Insert(prefix) => {
+                                            let prefix_chars = prefix.chars().count();
+                                            self.editor_text.insert_str(cursor_byte, &prefix);
+                                            let new_char_idx = cursor_char + prefix_chars;
+                                            let mut state = edit_output.state.clone();
+                                            state.cursor.set_char_range(Some(
+                                                egui::text_selection::CCursorRange::one(
+                                                    egui::text::CCursor::new(new_char_idx),
+                                                ),
+                                            ));
+                                            state.store(ui.ctx(), editor_persistent_id);
+                                        }
+                                        ListContinuation::ExitList => {
+                                            // 删掉空 marker 行 + 刚插入的 \n
+                                            let removed_chars = self.editor_text
+                                                [prev_line_start..cursor_byte]
+                                                .chars()
+                                                .count();
+                                            self.editor_text
+                                                .replace_range(prev_line_start..cursor_byte, "");
+                                            let new_char_idx =
+                                                cursor_char.saturating_sub(removed_chars);
+                                            let mut state = edit_output.state.clone();
+                                            state.cursor.set_char_range(Some(
+                                                egui::text_selection::CCursorRange::one(
+                                                    egui::text::CCursor::new(new_char_idx),
+                                                ),
+                                            ));
+                                            state.store(ui.ctx(), editor_persistent_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+                self.last_editor_text_len = self.editor_text.len();
 
                 if resp.has_focus() {
                     if let Some(range) = edit_output.cursor_range {
@@ -969,6 +1033,10 @@ impl NxNoteApp {
         let theme_done = &mut self.settings_theme_done;
         let cfg_dirty = &mut self.cfg_dirty;
         let mut should_close = false;
+        let current_fg = self
+            .fg
+            .as_ref()
+            .map(|f| f.exe_path.to_string_lossy().to_string());
 
         let size = egui::vec2(640.0, 460.0);
         let mut builder = egui::ViewportBuilder::default()
@@ -1006,7 +1074,7 @@ impl NxNoteApp {
                     should_close = true;
                 }
                 let before = serde_json::to_string(cfg).unwrap_or_default();
-                settings_ui::draw_settings_window(sctx, cfg);
+                settings_ui::draw_settings_window(sctx, cfg, current_fg.clone());
                 let after = serde_json::to_string(cfg).unwrap_or_default();
                 if before != after {
                     *cfg_dirty = true;
@@ -1074,6 +1142,72 @@ impl eframe::App for NxNoteApp {
 }
 
 /// 用 egui 真实字体度量做二分截断；对中英文混排都准确。
+enum ListContinuation {
+    Insert(String),
+    ExitList,
+}
+
+fn continue_list_on_enter(prev_line: &str) -> Option<ListContinuation> {
+    let b = prev_line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let indent = &prev_line[..i];
+
+    // 无序列表
+    if i < b.len() && matches!(b[i], b'-' | b'*' | b'+') && b.get(i + 1) == Some(&b' ') {
+        let marker_char = b[i] as char;
+        let content_start = i + 2;
+        let content = if content_start <= prev_line.len() {
+            &prev_line[content_start..]
+        } else {
+            ""
+        };
+        if content.trim().is_empty() {
+            return Some(ListContinuation::ExitList);
+        }
+        return Some(ListContinuation::Insert(format!(
+            "{}{} ",
+            indent, marker_char
+        )));
+    }
+
+    // 有序列表
+    let digit_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > digit_start && b.get(i) == Some(&b'.') && b.get(i + 1) == Some(&b' ') {
+        let num: usize = prev_line[digit_start..i].parse().unwrap_or(1);
+        let content_start = i + 2;
+        let content = if content_start <= prev_line.len() {
+            &prev_line[content_start..]
+        } else {
+            ""
+        };
+        if content.trim().is_empty() {
+            return Some(ListContinuation::ExitList);
+        }
+        return Some(ListContinuation::Insert(format!(
+            "{}{}. ",
+            indent,
+            num + 1
+        )));
+    }
+    None
+}
+
+fn byte_offset_from_char(text: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
 /// 黑名单匹配：宽松匹配，支持完整路径 / 带扩展名文件 / 裸文件名 / 路径子串。
 /// 全部不区分大小写。
 fn app_blocked(blocked: &[String], exe: &std::path::Path) -> bool {
