@@ -5,7 +5,7 @@ use egui::{
 use crate::icons;
 use crate::theme::{palette, ThemeMode};
 
-pub const TITLE_BAR_HEIGHT: f32 = 32.0;
+pub const TITLE_BAR_HEIGHT: f32 = 24.0;
 const RESIZE_THICK: f32 = 4.0;
 
 pub struct TitleBarConfig<'a> {
@@ -32,14 +32,14 @@ pub fn draw_title_bar(ctx: &egui::Context, ui: &mut Ui, rect: Rect, cfg: TitleBa
 
     // 标题文字（居左）
     painter.text(
-        pos2(rect.left() + 10.0, rect.center().y),
+        pos2(rect.left() + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
         cfg.title,
-        FontId::proportional(13.0),
+        FontId::proportional(11.5),
         p.text_strong,
     );
 
-    let btn_w = 38.0;
+    let btn_w = 32.0;
     let mut right = rect.right();
 
     // 关闭按钮
@@ -106,7 +106,7 @@ pub fn nav_button(
         rect.center(),
         Align2::CENTER_CENTER,
         glyph,
-        icons::font(14.0),
+        icons::font(12.0),
         fg,
     );
     resp.clicked()

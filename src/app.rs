@@ -57,7 +57,8 @@ pub struct NxNoteApp {
     title_first_frame: bool,
     title_pending_target: Option<bool>,
     title_pending_since: Option<Instant>,
-    editor_cursor_line: Option<usize>,
+    /// (line, col) 都是 0-based；显示时 +1
+    editor_cursor_pos: Option<(usize, usize)>,
     last_editor_text_len: usize,
 
     settings_open: bool,
@@ -117,7 +118,7 @@ impl NxNoteApp {
             title_first_frame: true,
             title_pending_target: None,
             title_pending_since: None,
-            editor_cursor_line: None,
+            editor_cursor_pos: None,
             last_editor_text_len: 0,
             settings_open: false,
             settings_fonts_done: false,
@@ -621,39 +622,39 @@ impl NxNoteApp {
         if total_w < 20.0 {
             return;
         }
-        // 左侧：脏标 + 笔记名（最多占 55%）
-        let dot = if self.dirty { "●" } else { "○" };
-        let left_text = format!("{} {}", dot, self.note_name);
-        let left_max = (total_w * 0.55 - 4.0).max(20.0);
-        let left = truncate_to_fit(ui, &left_text, left_max, font.clone());
-        let left_size = ui.fonts(|f| {
-            f.layout_no_wrap(left.clone(), font.clone(), egui::Color32::PLACEHOLDER)
-                .size()
-        });
-        painter.text(
-            egui::pos2(rect.left() + pad, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            left,
-            font.clone(),
-            p.text_weak,
-        );
 
-        // 右侧：前台标题（剩余宽度，留 8px 间隔）
-        let used = left_size.x + 8.0;
-        let right_max = total_w - used - 4.0;
-        if right_max < 24.0 {
-            return;
-        }
-        if let Some(fg) = &self.fg {
-            let right = truncate_to_fit(ui, &fg.title, right_max, font.clone());
+        // 左下：光标位置（聚焦时）+ 脏标
+        let cursor_part = self
+            .editor_cursor_pos
+            .map(|(l, c)| format!("行 {} 列 {}", l + 1, c + 1));
+        let dirty_part = if self.dirty { Some("●".to_string()) } else { None };
+        let left_text = match (cursor_part, dirty_part) {
+            (Some(c), Some(d)) => format!("{c}  {d}"),
+            (Some(c), None) => c,
+            (None, Some(d)) => d,
+            (None, None) => String::new(),
+        };
+        if !left_text.is_empty() {
+            let left = truncate_to_fit(ui, &left_text, (total_w * 0.55).max(40.0), font.clone());
             painter.text(
-                egui::pos2(rect.right() - pad, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                right,
-                font,
+                egui::pos2(rect.left() + pad, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                left,
+                font.clone(),
                 p.text_weak,
             );
         }
+
+        // 右下：字数（按字符计，CJK 一个字 = 1）
+        let count = self.editor_text.chars().count();
+        let right_text = format!("{} 字", count);
+        painter.text(
+            egui::pos2(rect.right() - pad, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            right_text,
+            font,
+            p.text_weak,
+        );
     }
 
     fn draw_central(&mut self, ui: &mut egui::Ui) {
@@ -701,7 +702,7 @@ impl NxNoteApp {
                 let editor_h = avail.y.max(60.0);
                 let theme_mode = self.cfg.theme_mode;
                 let base_size = self.cfg.font_size;
-                let cursor_line = self.editor_cursor_line;
+                let cursor_line = self.editor_cursor_pos.map(|(l, _)| l);
                 let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
                     let styles = md_highlight::Styles {
                         p: palette(theme_mode),
@@ -790,7 +791,10 @@ impl NxNoteApp {
                 if resp.has_focus() {
                     if let Some(range) = edit_output.cursor_range {
                         // 给 layouter 下一帧用：当前光标所在段（=行）
-                        self.editor_cursor_line = Some(range.primary.pcursor.paragraph);
+                        self.editor_cursor_pos = Some((
+                            range.primary.pcursor.paragraph,
+                            range.primary.pcursor.offset,
+                        ));
                         let crect = edit_output.galley.pos_from_cursor(&range.primary);
                         let x = edit_output.galley_pos.x + crect.left();
                         let y_top = edit_output.galley_pos.y + crect.top();
