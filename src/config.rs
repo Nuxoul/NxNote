@@ -3,6 +3,61 @@ use std::path::PathBuf;
 
 use crate::theme::ThemeMode;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MdColors {
+    pub text: [u8; 3],
+    pub heading: [u8; 3],
+    pub bold: [u8; 3],
+    pub italic: [u8; 3],
+    pub code_text: [u8; 3],
+    pub code_bg: [u8; 3],
+    pub link: [u8; 3],
+    pub quote_text: [u8; 3],
+    pub quote_bar: [u8; 3],
+    pub list_marker: [u8; 3],
+    pub syntax: [u8; 3],
+}
+
+impl MdColors {
+    pub fn default_dark() -> Self {
+        Self {
+            text: [216, 210, 196],
+            heading: [245, 175, 90],
+            bold: [255, 255, 255],
+            italic: [245, 175, 90],
+            code_text: [245, 180, 110],
+            code_bg: [52, 36, 22],
+            link: [120, 200, 220],
+            quote_text: [140, 170, 200],
+            quote_bar: [110, 145, 180],
+            list_marker: [245, 175, 90],
+            syntax: [140, 132, 118],
+        }
+    }
+    pub fn default_light() -> Self {
+        Self {
+            text: [40, 36, 30],
+            heading: [178, 110, 40],
+            bold: [10, 8, 6],
+            italic: [178, 110, 40],
+            code_text: [148, 92, 42],
+            code_bg: [240, 226, 200],
+            link: [50, 110, 180],
+            quote_text: [70, 90, 130],
+            quote_bar: [110, 145, 180],
+            list_marker: [178, 110, 40],
+            syntax: [150, 140, 124],
+        }
+    }
+}
+
+fn default_md_dark() -> MdColors {
+    MdColors::default_dark()
+}
+fn default_md_light() -> MdColors {
+    MdColors::default_light()
+}
+
 pub fn data_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("NxNote");
@@ -36,6 +91,10 @@ pub struct Config {
     /// 黑名单：完整 exe 路径或裸文件名（不区分大小写）。命中后视为未绑定，落回 scratch。
     #[serde(default)]
     pub blocked_apps: Vec<String>,
+    #[serde(default = "default_md_dark")]
+    pub md_dark: MdColors,
+    #[serde(default = "default_md_light")]
+    pub md_light: MdColors,
 }
 
 fn default_autohide() -> bool {
@@ -58,6 +117,8 @@ impl Default for Config {
             autohide_title_bar: true,
             auto_follow_foreground: false,
             blocked_apps: Vec::new(),
+            md_dark: MdColors::default_dark(),
+            md_light: MdColors::default_light(),
         }
     }
 }

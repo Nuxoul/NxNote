@@ -1,31 +1,31 @@
 //! Typora 风格的 inline markdown live preview。
-//! - 不在光标行的 `# ** ` [ ]` 等语法标记 alpha=0 → 不可见但仍占位置
-//! - 光标移到该行才显示标记
-//! - 标记的可见性切换不引起内容重排（字号 / 宽度都保留）
-//! - 列表 marker `- ` `1. ` 始终可见（属于"内容感"，不是噪声）
-//! - blockquote `> ` 用 slate 蓝色，CJK 字体没斜体则颜色顶替
+//! 颜色全部来自 Config.md_dark / md_light，可在「颜色配置」三级窗口里改。
+//!
+//! - 不在光标行的 `# ** ` [ ]` 等语法标记 字号→0.1pt 不可见也不占位
+//! - 无序列表 `-` `*` `+` 的字符整段透明（保宽度），由 draw_editor 在原位
+//!   overlay 一个 · 字形——所以即使光标在该行，看到的也是 ·
+//! - 有序列表 `1.` `2.` 始终用 list_marker 颜色（数字本身有内容感）
 
 use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, Stroke, TextFormat};
 
+use crate::config::MdColors;
 use crate::theme::Palette;
 
 #[derive(Clone, Copy)]
-pub struct Styles {
+pub struct Styles<'a> {
     pub p: Palette,
     pub base: f32,
     pub cursor_line: Option<usize>,
+    pub c: &'a MdColors,
 }
-
-const AMBER_BRIGHT: Color32 = Color32::from_rgb(245, 175, 90);
-const CODE_TEXT: Color32 = Color32::from_rgb(245, 180, 110);
-const CODE_BG: Color32 = Color32::from_rgb(52, 36, 22);
-const LINK_CYAN: Color32 = Color32::from_rgb(120, 200, 220);
-const QUOTE_COLOR: Color32 = Color32::from_rgb(140, 170, 200);
-const QUOTE_BAR: Color32 = Color32::from_rgb(110, 145, 180);
 
 /// 隐藏 marker 时使用的极小字号 —— Galley 按字号算宽度，0.1pt 视觉上接近 0
 const HIDDEN_SIZE: f32 = 0.1;
+
+fn rgb(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
 
 fn hidden_fmt(family: FontFamily) -> TextFormat {
     TextFormat {
@@ -35,7 +35,7 @@ fn hidden_fmt(family: FontFamily) -> TextFormat {
     }
 }
 
-impl Styles {
+impl<'a> Styles<'a> {
     fn mono(&self, size: f32, color: Color32) -> TextFormat {
         TextFormat {
             font_id: FontId::new(size, FontFamily::Monospace),
@@ -52,11 +52,11 @@ impl Styles {
     }
 
     fn normal(&self) -> TextFormat {
-        self.mono(self.base, self.p.text)
+        self.mono(self.base, rgb(self.c.text))
     }
     fn syntax(&self, visible: bool) -> TextFormat {
         if visible {
-            self.mono(self.base, self.p.text_weak)
+            self.mono(self.base, rgb(self.c.syntax))
         } else {
             hidden_fmt(FontFamily::Monospace)
         }
@@ -66,7 +66,7 @@ impl Styles {
             let size = self.base * heading_scale(level);
             TextFormat {
                 font_id: FontId::new(size, FontFamily::Proportional),
-                color: self.p.text_weak,
+                color: rgb(self.c.syntax),
                 ..Default::default()
             }
         } else {
@@ -75,23 +75,22 @@ impl Styles {
     }
     fn heading_body(&self, level: u8) -> TextFormat {
         let size = self.base * heading_scale(level);
-        self.prop(size, AMBER_BRIGHT)
+        self.prop(size, rgb(self.c.heading))
     }
     fn code_inline_text(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: CODE_TEXT,
-            background: CODE_BG,
+            color: rgb(self.c.code_text),
+            background: rgb(self.c.code_bg),
             ..Default::default()
         }
     }
     fn code_inline_marker(&self, visible: bool) -> TextFormat {
         if visible {
-            // 反引号也加上 CODE_BG 让背景连续
             TextFormat {
                 font_id: FontId::new(self.base, FontFamily::Monospace),
-                color: self.p.text_weak,
-                background: CODE_BG,
+                color: rgb(self.c.syntax),
+                background: rgb(self.c.code_bg),
                 ..Default::default()
             }
         } else {
@@ -101,18 +100,18 @@ impl Styles {
     fn code_block(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: Color32::from_rgb(225, 220, 205),
-            background: CODE_BG,
+            color: rgb(self.c.code_text),
+            background: rgb(self.c.code_bg),
             ..Default::default()
         }
     }
     fn bold(&self) -> TextFormat {
-        self.mono(self.base, Color32::WHITE)
+        self.mono(self.base, rgb(self.c.bold))
     }
     fn italic(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: AMBER_BRIGHT,
+            color: rgb(self.c.italic),
             italics: true,
             ..Default::default()
         }
@@ -120,8 +119,8 @@ impl Styles {
     fn link_text(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
-            color: LINK_CYAN,
-            underline: Stroke::new(1.0, LINK_CYAN),
+            color: rgb(self.c.link),
+            underline: Stroke::new(1.0, rgb(self.c.link)),
             ..Default::default()
         }
     }
@@ -129,7 +128,7 @@ impl Styles {
         if visible {
             TextFormat {
                 font_id: FontId::new(self.base, FontFamily::Monospace),
-                color: QUOTE_BAR,
+                color: rgb(self.c.quote_bar),
                 ..Default::default()
             }
         } else {
@@ -137,13 +136,21 @@ impl Styles {
         }
     }
     fn quote(&self) -> TextFormat {
-        self.mono(self.base, QUOTE_COLOR)
+        self.mono(self.base, rgb(self.c.quote_text))
     }
     fn hr(&self) -> TextFormat {
         self.mono(self.base, self.p.stroke)
     }
-    fn list_marker(&self) -> TextFormat {
-        self.mono(self.base, AMBER_BRIGHT)
+    fn list_marker_ordered(&self) -> TextFormat {
+        self.mono(self.base, rgb(self.c.list_marker))
+    }
+    /// 无序 marker：完全透明保宽——draw_editor 会画一个 · 覆盖
+    fn list_marker_unordered_hidden(&self) -> TextFormat {
+        TextFormat {
+            font_id: FontId::new(self.base, FontFamily::Monospace),
+            color: Color32::TRANSPARENT,
+            ..Default::default()
+        }
     }
 }
 
@@ -158,7 +165,7 @@ fn heading_scale(level: u8) -> f32 {
     }
 }
 
-pub fn build(text: &str, s: Styles) -> LayoutJob {
+pub fn build(text: &str, s: Styles<'_>) -> LayoutJob {
     let mut job = LayoutJob::default();
     let mut in_code_block = false;
 
@@ -183,7 +190,13 @@ pub fn build(text: &str, s: Styles) -> LayoutJob {
     job
 }
 
-fn process_line(job: &mut LayoutJob, line: &str, on_cursor: bool, s: Styles, in_code_block: &mut bool) {
+fn process_line(
+    job: &mut LayoutJob,
+    line: &str,
+    on_cursor: bool,
+    s: Styles<'_>,
+    in_code_block: &mut bool,
+) {
     if line.trim_start().starts_with("```") {
         *in_code_block = !*in_code_block;
         job.append(line, 0.0, s.syntax(on_cursor));
@@ -213,15 +226,24 @@ fn process_line(job: &mut LayoutJob, line: &str, on_cursor: bool, s: Styles, in_
         return;
     }
 
-    if let Some(marker_end) = unordered_list_marker(line) {
-        // 列表 marker 始终可见
-        job.append(&line[..marker_end], 0.0, s.list_marker());
+    if let Some(parts) = unordered_list_marker(line) {
+        let (indent_end, marker_end) = parts;
+        // 缩进保正常
+        if indent_end > 0 {
+            job.append(&line[..indent_end], 0.0, s.normal());
+        }
+        // 单字符 marker 透明保宽 (draw_editor 在这位置 overlay ·)
+        job.append(&line[indent_end..indent_end + 1], 0.0, s.list_marker_unordered_hidden());
+        // marker 后的空格 / 全角空格也用 normal
+        if marker_end > indent_end + 1 {
+            job.append(&line[indent_end + 1..marker_end], 0.0, s.normal());
+        }
         append_inline_with(job, &line[marker_end..], s, s.normal(), on_cursor);
         return;
     }
 
     if let Some(marker_end) = ordered_list_marker(line) {
-        job.append(&line[..marker_end], 0.0, s.list_marker());
+        job.append(&line[..marker_end], 0.0, s.list_marker_ordered());
         append_inline_with(job, &line[marker_end..], s, s.normal(), on_cursor);
         return;
     }
@@ -271,7 +293,8 @@ fn blockquote_prefix(line: &str) -> Option<usize> {
     }
 }
 
-fn unordered_list_marker(line: &str) -> Option<usize> {
+/// 返回 (indent_end, marker_end). marker 字节位置 = indent_end (single ASCII byte)
+pub fn unordered_list_marker(line: &str) -> Option<(usize, usize)> {
     let b = line.as_bytes();
     let mut i = 0;
     while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
@@ -284,14 +307,15 @@ fn unordered_list_marker(line: &str) -> Option<usize> {
     if !matches!(c, b'-' | b'*' | b'+') {
         return None;
     }
+    let indent_end = i;
     if b.get(i + 1) == Some(&b' ') {
-        return Some(i + 2);
+        return Some((indent_end, i + 2));
     }
     if b.get(i + 1) == Some(&0xE3)
         && b.get(i + 2) == Some(&0x80)
         && b.get(i + 3) == Some(&0x80)
     {
-        return Some(i + 4);
+        return Some((indent_end, i + 4));
     }
     None
 }
@@ -330,7 +354,7 @@ fn ordered_list_marker(line: &str) -> Option<usize> {
 fn append_inline_with(
     job: &mut LayoutJob,
     text: &str,
-    s: Styles,
+    s: Styles<'_>,
     default: TextFormat,
     on_cursor: bool,
 ) {

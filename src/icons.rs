@@ -35,3 +35,5 @@ pub const HISTORY: &str = "\u{E889}";         // history
 pub const APPS: &str = "\u{E5C3}";            // apps (九宫格)
 pub const COMPUTER: &str = "\u{E30A}";        // computer
 pub const KEYBOARD: &str = "\u{E312}";        // keyboard
+pub const STAY_ON_TOP: &str = "\u{E25A}";     // vertical_align_top
+pub const COLOR_LENS: &str = "\u{E3B7}";      // color_lens (调色板)

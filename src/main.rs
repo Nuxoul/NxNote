@@ -2,6 +2,7 @@
 
 mod app;
 mod chrome;
+mod color_ui;
 mod config;
 mod fonts;
 mod hotkey;

@@ -11,8 +11,13 @@ use crate::settings_ui;
 use crate::storage::{
     self, AppEntry, AppIndex, TitleRule, DEFAULT_NOTE, GLOBAL_FOLDER, SCRATCH_NOTE,
 };
-use crate::theme::{self, palette};
+use crate::theme::{self, palette, ThemeMode};
 use crate::watcher::{self, ForegroundInfo};
+
+enum PendingEditorAction {
+    InsertText(String),
+    Backspaces(usize),
+}
 
 #[derive(Default, PartialEq, Eq, Clone)]
 enum Modal {
@@ -60,11 +65,17 @@ pub struct NxNoteApp {
     /// (line, col) 都是 0-based；显示时 +1
     editor_cursor_pos: Option<(usize, usize)>,
     last_editor_text_len: usize,
+    /// 排队到下一帧由 egui 自己注入的事件（列表续行/退出）。
+    /// 自己 mutate 文本 + state.cursor.store 在 0.29 不可靠（光标飘到符号前），
+    /// 改用 Event::Text / Event::Key(Backspace) 让 TextEdit 自己处理。
+    pending_editor_action: Option<PendingEditorAction>,
 
     settings_open: bool,
     settings_fonts_done: bool,
     settings_theme_done: bool,
     settings_pos_applied: bool,
+    color_editor_open: bool,
+    color_editor_pos_applied: bool,
 }
 
 impl NxNoteApp {
@@ -78,9 +89,30 @@ impl NxNoteApp {
         };
 
         let index = AppIndex::load();
-        let folder_key = GLOBAL_FOLDER.to_string();
-        let display_name = "速记".to_string();
-        let note_name = SCRATCH_NOTE.to_string();
+        let (folder_key, display_name, note_name) =
+            match (
+                index.last_folder_key.clone(),
+                index.last_note_name.clone(),
+                index.last_display_name.clone(),
+            ) {
+                (Some(f), Some(n), Some(d)) => {
+                    // 保险：folder 必须真的存在，否则退回速记
+                    if f == GLOBAL_FOLDER || index.apps.contains_key(&f) {
+                        (f, d, n)
+                    } else {
+                        (
+                            GLOBAL_FOLDER.to_string(),
+                            "速记".to_string(),
+                            SCRATCH_NOTE.to_string(),
+                        )
+                    }
+                }
+                _ => (
+                    GLOBAL_FOLDER.to_string(),
+                    "速记".to_string(),
+                    SCRATCH_NOTE.to_string(),
+                ),
+            };
         let editor_text = storage::load_note(&folder_key, &note_name);
 
         let last_applied_theme = cfg.theme_mode;
@@ -120,10 +152,13 @@ impl NxNoteApp {
             title_pending_since: None,
             editor_cursor_pos: None,
             last_editor_text_len: 0,
+            pending_editor_action: None,
             settings_open: false,
             settings_fonts_done: false,
             settings_theme_done: false,
             settings_pos_applied: false,
+            color_editor_open: false,
+            color_editor_pos_applied: false,
         }
     }
 
@@ -145,6 +180,11 @@ impl NxNoteApp {
         self.note_name = note_name;
         self.editor_text = storage::load_note(&self.folder_key, &self.note_name);
         self.last_edit = None;
+        // 持久化"上次界面"，方便启动时回到这里
+        self.index.last_folder_key = Some(self.folder_key.clone());
+        self.index.last_note_name = Some(self.note_name.clone());
+        self.index.last_display_name = Some(self.display_name.clone());
+        let _ = self.index.save();
     }
 
     fn handle_foreground_change(&mut self, info: ForegroundInfo) {
@@ -430,14 +470,14 @@ impl NxNoteApp {
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let full = ui.max_rect();
 
-            // 标题栏（条件显示）：包含 ✕ □ — 与拖拽区
+            // 标题栏（条件显示）：包含 ✕ □ — 置顶 与拖拽区
             let title_h = if self.title_visible { TITLE_BAR_HEIGHT } else { 0.0 };
             if self.title_visible {
                 let title_rect = egui::Rect::from_min_max(
                     full.min,
                     egui::pos2(full.right(), full.top() + TITLE_BAR_HEIGHT),
                 );
-                chrome::draw_title_bar(
+                let out = chrome::draw_title_bar(
                     ctx,
                     ui,
                     title_rect,
@@ -445,8 +485,20 @@ impl NxNoteApp {
                         title: "NxNote",
                         show_min_max: true,
                         mode: self.cfg.theme_mode,
+                        on_top: Some(self.cfg.always_on_top),
                     },
                 );
+                if out.on_top_toggled {
+                    self.cfg.always_on_top = !self.cfg.always_on_top;
+                    let _ = self.cfg.save();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                        if self.cfg.always_on_top {
+                            egui::WindowLevel::AlwaysOnTop
+                        } else {
+                            egui::WindowLevel::Normal
+                        },
+                    ));
+                }
             }
 
             // 工具栏（始终在 title 下方；title 隐藏时即位于窗口顶部）
@@ -703,11 +755,16 @@ impl NxNoteApp {
                 let theme_mode = self.cfg.theme_mode;
                 let base_size = self.cfg.font_size;
                 let cursor_line = self.editor_cursor_pos.map(|(l, _)| l);
+                let md_colors = match theme_mode {
+                    ThemeMode::Light => self.cfg.md_light.clone(),
+                    _ => self.cfg.md_dark.clone(),
+                };
                 let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
                     let styles = md_highlight::Styles {
                         p: palette(theme_mode),
                         base: base_size,
                         cursor_line,
+                        c: &md_colors,
                     };
                     let mut job = md_highlight::build(text, styles);
                     job.wrap.max_width = wrap_width;
@@ -724,6 +781,7 @@ impl NxNoteApp {
                     .show(ui);
 
                 let resp = edit_output.response;
+                let _ = editor_persistent_id; // 现在用事件注入，不再 store cursor 到 state
                 let new_len = self.editor_text.len();
                 let just_inserted_char = new_len == self.last_editor_text_len + 1;
                 if resp.changed() {
@@ -731,7 +789,10 @@ impl NxNoteApp {
                     self.last_edit = Some(Instant::now());
 
                     // 自动续/退列表：当用户在列表行末尾按 Enter
-                    if just_inserted_char {
+                    // 改成给下一帧排队 Event::Text / Event::Key(Backspace)，
+                    // 让 TextEdit 自己处理，光标位置由 egui 自动算 —— 不再走
+                    // state.cursor.set_char_range（在 0.29 里它经常不生效）。
+                    if just_inserted_char && self.pending_editor_action.is_none() {
                         if let Some(range) = edit_output.cursor_range {
                             let cursor_char = range.primary.ccursor.index;
                             let cursor_byte =
@@ -751,42 +812,68 @@ impl NxNoteApp {
                                 if let Some(cont) = continue_list_on_enter(&prev_line) {
                                     match cont {
                                         ListContinuation::Insert(prefix) => {
-                                            let prefix_chars = prefix.chars().count();
-                                            self.editor_text.insert_str(cursor_byte, &prefix);
-                                            let new_char_idx = cursor_char + prefix_chars;
-                                            let mut state = edit_output.state.clone();
-                                            state.cursor.set_char_range(Some(
-                                                egui::text_selection::CCursorRange::one(
-                                                    egui::text::CCursor::new(new_char_idx),
-                                                ),
-                                            ));
-                                            state.store(ui.ctx(), editor_persistent_id);
+                                            self.pending_editor_action =
+                                                Some(PendingEditorAction::InsertText(prefix));
                                         }
                                         ListContinuation::ExitList => {
-                                            // 删掉空 marker 行 + 刚插入的 \n
-                                            let removed_chars = self.editor_text
+                                            // 需要删除：[prev_line_start..cursor_byte) 这段
+                                            // 包含空 marker + 刚刚 egui 插入的 \n
+                                            let to_delete = self.editor_text
                                                 [prev_line_start..cursor_byte]
                                                 .chars()
                                                 .count();
-                                            self.editor_text
-                                                .replace_range(prev_line_start..cursor_byte, "");
-                                            let new_char_idx =
-                                                cursor_char.saturating_sub(removed_chars);
-                                            let mut state = edit_output.state.clone();
-                                            state.cursor.set_char_range(Some(
-                                                egui::text_selection::CCursorRange::one(
-                                                    egui::text::CCursor::new(new_char_idx),
-                                                ),
-                                            ));
-                                            state.store(ui.ctx(), editor_persistent_id);
+                                            self.pending_editor_action =
+                                                Some(PendingEditorAction::Backspaces(to_delete));
                                         }
                                     }
+                                    ui.ctx().request_repaint();
                                 }
                             }
                         }
                     }
                 }
                 self.last_editor_text_len = self.editor_text.len();
+
+                // 无序列表 - / * / + 渲染为 ·：md_highlight 把 marker 字符整段
+                // 透明保宽，这里在原位画一个圆点 overlay 上去
+                let list_marker_rgb = match theme_mode {
+                    ThemeMode::Light => self.cfg.md_light.list_marker,
+                    _ => self.cfg.md_dark.list_marker,
+                };
+                let bullet_color = egui::Color32::from_rgb(
+                    list_marker_rgb[0],
+                    list_marker_rgb[1],
+                    list_marker_rgb[2],
+                );
+                let bullet_font = egui::FontId::new(
+                    self.cfg.font_size * 1.4,
+                    egui::FontFamily::Monospace,
+                );
+                let bullet_painter = ui.painter_at(edit_output.text_clip_rect);
+                let galley = edit_output.galley.clone();
+                let galley_pos = edit_output.galley_pos;
+                let mut byte_pos = 0usize;
+                for line in self.editor_text.split('\n') {
+                    if let Some((indent_end, _marker_end)) =
+                        md_highlight::unordered_list_marker(line)
+                    {
+                        let dash_byte = byte_pos + indent_end;
+                        let dash_char =
+                            self.editor_text[..dash_byte].chars().count();
+                        let r0 = galley.pos_from_ccursor(egui::text::CCursor::new(dash_char));
+                        let r1 = galley.pos_from_ccursor(egui::text::CCursor::new(dash_char + 1));
+                        let cx = galley_pos.x + (r0.left() + r1.left()) / 2.0;
+                        let cy = galley_pos.y + r0.center().y;
+                        bullet_painter.text(
+                            egui::pos2(cx, cy),
+                            egui::Align2::CENTER_CENTER,
+                            "·",
+                            bullet_font.clone(),
+                            bullet_color,
+                        );
+                    }
+                    byte_pos += line.len() + 1;
+                }
 
                 if resp.has_focus() {
                     if let Some(range) = edit_output.cursor_range {
@@ -1079,6 +1166,17 @@ impl NxNoteApp {
             },
         );
 
+        // 设置里的「颜色配置」按钮通过 ctx memory 给我们传信号
+        let open_color = ctx.memory_mut(|m| {
+            m.data
+                .remove_temp::<bool>(egui::Id::new("nx_open_color_editor"))
+                .unwrap_or(false)
+        });
+        if open_color {
+            self.color_editor_open = true;
+            self.color_editor_pos_applied = false;
+        }
+
         if should_close {
             self.settings_open = false;
             self.settings_fonts_done = false;
@@ -1087,14 +1185,6 @@ impl NxNoteApp {
             if self.cfg_dirty {
                 let _ = self.cfg.save();
                 self.cfg_dirty = false;
-                // 应用置顶切换
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                    if self.cfg.always_on_top {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::WindowLevel::Normal
-                    },
-                ));
                 // 热键变化则重新绑定
                 if self.cfg.hotkey != self.last_bound_hotkey {
                     self._hotkey = None;
@@ -1104,11 +1194,86 @@ impl NxNoteApp {
             }
         }
     }
+
+    fn draw_color_editor_viewport(&mut self, ctx: &egui::Context) {
+        if !self.color_editor_open {
+            return;
+        }
+        let cfg = &mut self.cfg;
+        let cfg_dirty = &mut self.cfg_dirty;
+        let mut should_close = false;
+
+        let size = egui::vec2(520.0, 460.0);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("NxNote 颜色配置")
+            .with_inner_size(size)
+            .with_min_inner_size([420.0, 340.0])
+            .with_decorations(false)
+            .with_resizable(true);
+
+        if !self.color_editor_pos_applied {
+            let monitor = ctx
+                .input(|i| i.viewport().monitor_size)
+                .unwrap_or(egui::vec2(1920.0, 1080.0));
+            let pos = egui::pos2(
+                ((monitor.x - size.x) * 0.5).max(0.0),
+                ((monitor.y - size.y) * 0.5).max(0.0),
+            );
+            builder = builder.with_position(pos);
+            self.color_editor_pos_applied = true;
+        }
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("nx_color_editor"),
+            builder,
+            |sctx, _| {
+                if sctx.input(|i| i.viewport().close_requested()) {
+                    should_close = true;
+                }
+                let before = serde_json::to_string(cfg).unwrap_or_default();
+                crate::color_ui::draw_color_editor(sctx, cfg);
+                let after = serde_json::to_string(cfg).unwrap_or_default();
+                if before != after {
+                    *cfg_dirty = true;
+                }
+            },
+        );
+
+        if should_close {
+            self.color_editor_open = false;
+            self.color_editor_pos_applied = false;
+            if self.cfg_dirty {
+                let _ = self.cfg.save();
+                self.cfg_dirty = false;
+            }
+        }
+    }
 }
 
 impl eframe::App for NxNoteApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.capture_hwnd(frame);
+
+        // 上一帧排队的列表续行注入到当前帧 events 里，让 TextEdit 自己消费
+        if let Some(action) = self.pending_editor_action.take() {
+            ctx.input_mut(|i| match action {
+                PendingEditorAction::InsertText(s) => {
+                    i.events.push(egui::Event::Text(s));
+                }
+                PendingEditorAction::Backspaces(n) => {
+                    for _ in 0..n {
+                        i.events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+            });
+        }
+
         self.drain_foreground();
         self.drain_hotkey(ctx);
         self.drain_tray(ctx);
@@ -1120,6 +1285,7 @@ impl eframe::App for NxNoteApp {
 
         self.draw_main_frame(ctx);
         self.draw_settings_viewport(ctx);
+        self.draw_color_editor_viewport(ctx);
 
         // 编辑器聚焦时连续重绘，最小化输入延迟
         let focused = ctx.memory(|m| m.focused().is_some());

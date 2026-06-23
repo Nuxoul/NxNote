@@ -12,12 +12,26 @@ pub struct TitleBarConfig<'a> {
     pub title: &'a str,
     pub show_min_max: bool,
     pub mode: ThemeMode,
+    /// 显示"始终置顶"切换按钮；Some(state)=显示并反映状态，None=不显示
+    pub on_top: Option<bool>,
+}
+
+#[derive(Default)]
+pub struct TitleBarOutput {
+    /// 用户点击了"置顶"图标，外部应翻转 cfg.always_on_top 并下发 WindowLevel
+    pub on_top_toggled: bool,
 }
 
 /// 自绘标题栏。在调用方分配出来的 rect 内绘制。
-pub fn draw_title_bar(ctx: &egui::Context, ui: &mut Ui, rect: Rect, cfg: TitleBarConfig<'_>) {
+pub fn draw_title_bar(
+    ctx: &egui::Context,
+    ui: &mut Ui,
+    rect: Rect,
+    cfg: TitleBarConfig<'_>,
+) -> TitleBarOutput {
     let p = palette(cfg.mode);
     let painter = ui.painter_at(rect);
+    let mut out = TitleBarOutput::default();
 
     // 背景
     painter.rect_filled(rect, 0.0, p.bg);
@@ -44,7 +58,15 @@ pub fn draw_title_bar(ctx: &egui::Context, ui: &mut Ui, rect: Rect, cfg: TitleBa
 
     // 关闭按钮
     let close_rect = Rect::from_min_max(pos2(right - btn_w, rect.top()), pos2(right, rect.bottom()));
-    if nav_button(ui, close_rect, icons::CLOSE, Id::new("nx_tb_close"), p.danger, Color32::WHITE, p.text) {
+    if nav_button(
+        ui,
+        close_rect,
+        icons::CLOSE,
+        Id::new("nx_tb_close"),
+        p.danger,
+        Color32::WHITE,
+        p.text,
+    ) {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
     right -= btn_w;
@@ -52,7 +74,15 @@ pub fn draw_title_bar(ctx: &egui::Context, ui: &mut Ui, rect: Rect, cfg: TitleBa
     if cfg.show_min_max {
         // 最大化按钮
         let max_rect = Rect::from_min_max(pos2(right - btn_w, rect.top()), pos2(right, rect.bottom()));
-        if nav_button(ui, max_rect, icons::MAXIMIZE, Id::new("nx_tb_max"), p.hover, p.text_strong, p.text) {
+        if nav_button(
+            ui,
+            max_rect,
+            icons::MAXIMIZE,
+            Id::new("nx_tb_max"),
+            p.hover,
+            p.text_strong,
+            p.text,
+        ) {
             let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         }
@@ -60,8 +90,34 @@ pub fn draw_title_bar(ctx: &egui::Context, ui: &mut Ui, rect: Rect, cfg: TitleBa
 
         // 最小化按钮
         let min_rect = Rect::from_min_max(pos2(right - btn_w, rect.top()), pos2(right, rect.bottom()));
-        if nav_button(ui, min_rect, icons::MINIMIZE, Id::new("nx_tb_min"), p.hover, p.text_strong, p.text) {
+        if nav_button(
+            ui,
+            min_rect,
+            icons::MINIMIZE,
+            Id::new("nx_tb_min"),
+            p.hover,
+            p.text_strong,
+            p.text,
+        ) {
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        }
+        right -= btn_w;
+    }
+
+    // 置顶按钮（可选）
+    if let Some(active) = cfg.on_top {
+        let pin_rect = Rect::from_min_max(pos2(right - btn_w, rect.top()), pos2(right, rect.bottom()));
+        let normal_text = if active { p.accent } else { p.text_weak };
+        if nav_button(
+            ui,
+            pin_rect,
+            icons::STAY_ON_TOP,
+            Id::new("nx_tb_on_top"),
+            p.hover,
+            if active { p.accent } else { p.text_strong },
+            normal_text,
+        ) {
+            out.on_top_toggled = true;
         }
         right -= btn_w;
     }
@@ -79,6 +135,8 @@ pub fn draw_title_bar(ctx: &egui::Context, ui: &mut Ui, rect: Rect, cfg: TitleBa
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
     }
+
+    out
 }
 
 pub fn nav_button(

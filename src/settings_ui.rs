@@ -34,6 +34,7 @@ pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config, current_fg: O
                 title: "设置",
                 show_min_max: false,
                 mode: cfg.theme_mode,
+                on_top: None,
             },
         );
 
@@ -124,12 +125,42 @@ fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
                 ui.add_space(4.0);
                 ui.label(RichText::new("编辑字体").color(p.text).size(12.5));
                 font_list_picker(ui, "editor_fonts", &mut cfg.editor_fonts);
+                ui.add_space(6.0);
+                // 颜色配置入口 —— 用 LayoutJob 把图标和文字拼到同一行
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    icons::COLOR_LENS,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: icons::font(14.0),
+                        color: ui.visuals().text_color(),
+                        valign: Align::Center,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    "   颜色配置…",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: FontId::proportional(12.5),
+                        color: ui.visuals().text_color(),
+                        valign: Align::Center,
+                        ..Default::default()
+                    },
+                );
+                if ui
+                    .add_sized(Vec2::new(170.0, 26.0), egui::Button::new(job))
+                    .on_hover_text("分别配置深色 / 浅色主题下的 MD 渲染色")
+                    .clicked()
+                {
+                    ui.ctx().memory_mut(|m| {
+                        m.data
+                            .insert_temp(egui::Id::new("nx_open_color_editor"), true)
+                    });
+                }
             });
 
             section(ui, "窗口", &p, |ui| {
-                row(ui, "始终置顶", "窗口保持在最前", |ui| {
-                    toggle(ui, &mut cfg.always_on_top);
-                });
                 row(ui, "自动隐藏标题栏", "鼠标移开时收起窗口顶部", |ui| {
                     toggle(ui, &mut cfg.autohide_title_bar);
                 });

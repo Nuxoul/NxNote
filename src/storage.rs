@@ -45,6 +45,13 @@ pub struct AppEntry {
 pub struct AppIndex {
     #[serde(default)]
     pub apps: BTreeMap<String, AppEntry>,
+    /// 上次打开的笔记（启动时自动恢复）
+    #[serde(default)]
+    pub last_folder_key: Option<String>,
+    #[serde(default)]
+    pub last_note_name: Option<String>,
+    #[serde(default)]
+    pub last_display_name: Option<String>,
 }
 
 impl AppIndex {
