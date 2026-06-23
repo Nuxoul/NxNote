@@ -30,6 +30,9 @@ pub struct Config {
     pub editor_fonts: Vec<String>,
     #[serde(default = "default_autohide")]
     pub autohide_title_bar: bool,
+    /// 自动随前台应用切换笔记（默认关闭，需要时由用户在设置里打开）
+    #[serde(default)]
+    pub auto_follow_foreground: bool,
     /// 黑名单：完整 exe 路径或裸文件名（不区分大小写）。命中后视为未绑定，落回 scratch。
     #[serde(default)]
     pub blocked_apps: Vec<String>,
@@ -53,6 +56,7 @@ impl Default for Config {
             ui_fonts: Vec::new(),
             editor_fonts: Vec::new(),
             autohide_title_bar: true,
+            auto_follow_foreground: false,
             blocked_apps: Vec::new(),
         }
     }

@@ -151,8 +151,12 @@ impl NxNoteApp {
         if self.pinned {
             return;
         }
-        // 黑名单：命中就落回速记本
-        if app_blocked(&self.cfg.blocked_apps, &info.exe_path) {
+        // 自动跟随关闭：只刷新 fg + 索引，不切换当前视图。
+        // 仍维护索引让用户能从「所有应用…」里选到这个 app。
+        let auto = self.cfg.auto_follow_foreground;
+
+        // 黑名单：仅自动跟随模式下生效（关闭模式下用户自己选择，不需要兜底）
+        if auto && app_blocked(&self.cfg.blocked_apps, &info.exe_path) {
             if self.folder_key != GLOBAL_FOLDER {
                 self.switch_to(
                     GLOBAL_FOLDER.to_string(),
@@ -197,7 +201,9 @@ impl NxNoteApp {
 
         let display = entry.display_name.clone();
         let _ = self.index.save();
-        self.switch_to(folder, display, target_note);
+        if auto {
+            self.switch_to(folder, display, target_note);
+        }
     }
 
     fn drain_foreground(&mut self) {
@@ -298,9 +304,10 @@ impl NxNoteApp {
         }
     }
 
-    /// 每帧重检：黑名单变更后不需要等下次前台切换就能生效
+    /// 每帧重检：黑名单变更后不需要等下次前台切换就能生效。
+    /// 仅自动跟随模式下生效。
     fn enforce_blocklist(&mut self) {
-        if self.pinned {
+        if self.pinned || !self.cfg.auto_follow_foreground {
             return;
         }
         let Some(fg) = self.fg.clone() else {
@@ -374,7 +381,7 @@ impl NxNoteApp {
             mouse_in
         };
 
-        // 滞后：show 立即；hide 等 220ms，避免鼠标短暂出界就缩窗口闪烁
+        // 滞后：show 立即；hide 等 220ms，避免鼠标短暂出界就抖动
         let now = Instant::now();
         if want != self.title_visible {
             if self.title_pending_target != Some(want) {
@@ -392,26 +399,11 @@ impl NxNoteApp {
                 ));
                 return;
             }
-        } else {
-            self.title_pending_target = None;
-            self.title_pending_since = None;
-            return;
+            // 不再 resize 窗口：只切内部状态，draw_main_frame 会用 title_h=0
+            // 把上方 32px 让给工具栏，从而"标题栏向下位移到窗口后面"
+            self.title_visible = want;
+            ctx.request_repaint();
         }
-
-        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
-            return;
-        };
-        let delta = if want { TITLE_BAR_HEIGHT } else { -TITLE_BAR_HEIGHT };
-        let new_y = outer.min.y - delta;
-        let new_h = outer.size().y + delta;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            outer.width(),
-            new_h,
-        )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-            outer.min.x, new_y,
-        )));
-        self.title_visible = want;
         self.title_pending_target = None;
         self.title_pending_since = None;
     }

@@ -175,6 +175,14 @@ fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
             });
 
             section(ui, "自动行为", &p, |ui| {
+                row(
+                    ui,
+                    "随前台切换笔记",
+                    "打开后 NxNote 自动跟随当前前台应用；关闭则由你自己在菜单里选择",
+                    |ui| {
+                        toggle(ui, &mut cfg.auto_follow_foreground);
+                    },
+                );
                 row(ui, "保存延迟", "停止输入后写盘等待 (ms)", |ui| {
                     ui.add(
                         egui::DragValue::new(&mut cfg.autosave_delay_ms)
