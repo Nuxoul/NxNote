@@ -1127,7 +1127,8 @@ impl NxNoteApp {
             .with_inner_size(size)
             .with_min_inner_size([560.0, 380.0])
             .with_decorations(false)
-            .with_resizable(true);
+            .with_resizable(true)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop);
 
         if !self.settings_pos_applied {
             let monitor = ctx
@@ -1209,7 +1210,8 @@ impl NxNoteApp {
             .with_inner_size(size)
             .with_min_inner_size([420.0, 340.0])
             .with_decorations(false)
-            .with_resizable(true);
+            .with_resizable(true)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop);
 
         if !self.color_editor_pos_applied {
             let monitor = ctx
