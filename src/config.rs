@@ -95,6 +95,16 @@ pub struct Config {
     pub md_dark: MdColors,
     #[serde(default = "default_md_light")]
     pub md_light: MdColors,
+    /// 开机自启动：写入 HKCU\...\Run，指向当前 exe + `--hidden`
+    #[serde(default)]
+    pub autostart: bool,
+    /// 关闭按钮 / Alt+F4 时最小化到托盘而不是退出
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+}
+
+fn default_close_to_tray() -> bool {
+    true
 }
 
 fn default_autohide() -> bool {
@@ -119,6 +129,8 @@ impl Default for Config {
             blocked_apps: Vec::new(),
             md_dark: MdColors::default_dark(),
             md_light: MdColors::default_light(),
+            autostart: false,
+            close_to_tray: true,
         }
     }
 }

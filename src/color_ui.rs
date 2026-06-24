@@ -33,7 +33,7 @@ pub fn draw_color_editor(ctx: &egui::Context, cfg: &mut Config) {
             full.min,
             egui::pos2(full.right(), full.top() + TITLE_BAR_HEIGHT),
         );
-        chrome::draw_title_bar(
+        let tb_out = chrome::draw_title_bar(
             ctx,
             ui,
             title_rect,
@@ -44,6 +44,9 @@ pub fn draw_color_editor(ctx: &egui::Context, cfg: &mut Config) {
                 on_top: None,
             },
         );
+        if tb_out.close_clicked {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // tab 状态默认跟随当前主题
         let tab_id = egui::Id::new("nx_color_editor_tab");

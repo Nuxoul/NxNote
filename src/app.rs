@@ -1,7 +1,83 @@
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
 use crate::chrome::{self, TitleBarConfig, TITLE_BAR_HEIGHT};
+
+/// 全局主窗口 HWND，后台线程能拿到它直接调 Win32。
+pub static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 是否处于"最小化到托盘"隐藏态。所有线程共享，是窗口可见性的 source of truth。
+pub static MAIN_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// 给主窗口塞一条 WM_NULL，让 winit GetMessage 立刻返回 → eframe 跑一帧。
+#[cfg(windows)]
+pub fn wake_event_loop() {
+    let hwnd = MAIN_HWND.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_NULL};
+        let h = HWND(hwnd as *mut std::ffi::c_void);
+        let _ = PostMessageW(h, WM_NULL, WPARAM(0), LPARAM(0));
+    }
+}
+
+#[cfg(not(windows))]
+pub fn wake_event_loop() {}
+
+/// 任意线程都可调：把主窗口拽出来 + 抢前台 + 通知 eframe 跑一帧同步 self.hidden。
+#[cfg(windows)]
+pub fn force_show() {
+    let hwnd = MAIN_HWND.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetForegroundWindow, ShowWindow, SW_SHOW,
+        };
+        let h = HWND(hwnd as *mut std::ffi::c_void);
+        let _ = ShowWindow(h, SW_SHOW);
+        let _ = SetForegroundWindow(h);
+    }
+    MAIN_HIDDEN.store(false, Ordering::Release);
+    wake_event_loop();
+}
+
+#[cfg(windows)]
+pub fn force_hide() {
+    let hwnd = MAIN_HWND.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        let h = HWND(hwnd as *mut std::ffi::c_void);
+        let _ = ShowWindow(h, SW_HIDE);
+    }
+    MAIN_HIDDEN.store(true, Ordering::Release);
+    wake_event_loop();
+}
+
+#[cfg(windows)]
+pub fn force_toggle() {
+    if MAIN_HIDDEN.load(Ordering::Acquire) {
+        force_show();
+    } else {
+        force_hide();
+    }
+}
+
+#[cfg(not(windows))]
+pub fn force_show() {}
+#[cfg(not(windows))]
+pub fn force_hide() {}
+#[cfg(not(windows))]
+pub fn force_toggle() {}
 use crate::config::Config;
 use crate::fonts;
 use crate::hotkey::{self, HotkeyHandle};
@@ -57,7 +133,8 @@ pub struct NxNoteApp {
 
     pinned: bool,
     modal: Modal,
-    hidden_pos: Option<egui::Pos2>,
+    /// 是否已经"最小化到托盘"（窗口对 Windows 不可见，taskbar 上也没图标）
+    hidden: bool,
     title_visible: bool,
     title_first_frame: bool,
     title_pending_target: Option<bool>,
@@ -76,6 +153,12 @@ pub struct NxNoteApp {
     settings_pos_applied: bool,
     color_editor_open: bool,
     color_editor_pos_applied: bool,
+    /// 用于 cfg 比对：autostart 变化时同步注册表
+    last_applied_autostart: bool,
+    /// 托盘菜单点了退出 → 接下来这次 close_requested 不要再被拦回托盘
+    force_quit: bool,
+    /// 启动参数带 --hidden：n 帧后调 toggle_hidden（等 viewport 拿到 outer_rect）
+    pub start_hidden_pending: Option<u8>,
 }
 
 impl NxNoteApp {
@@ -121,7 +204,7 @@ impl NxNoteApp {
         let last_applied_editor_fonts = cfg.editor_fonts.clone();
         let last_bound_hotkey = cfg.hotkey.clone();
 
-        Self {
+        let mut s = Self {
             cfg,
             cfg_dirty: false,
             last_applied_theme,
@@ -145,7 +228,7 @@ impl NxNoteApp {
             last_edit: None,
             pinned: false,
             modal: Modal::None,
-            hidden_pos: None,
+            hidden: false,
             title_visible: true,
             title_first_frame: true,
             title_pending_target: None,
@@ -159,7 +242,12 @@ impl NxNoteApp {
             settings_pos_applied: false,
             color_editor_open: false,
             color_editor_pos_applied: false,
-        }
+            last_applied_autostart: false, // 在 new 里下面修复
+            force_quit: false,
+            start_hidden_pending: None,
+        };
+        s.last_applied_autostart = s.cfg.autostart;
+        s
     }
 
     fn save_current(&mut self) {
@@ -254,16 +342,20 @@ impl NxNoteApp {
     }
 
     fn drain_hotkey(&mut self, ctx: &egui::Context) {
-        let mut presses = 0;
+        // 热键 toggle 由后台线程的 force_toggle 直接处理过；这里只
+        // 同步 self.hidden 并在刚显示时下发 WindowLevel
+        let mut got = false;
         while let Ok(()) = self.hotkey_rx.try_recv() {
-            presses += 1;
+            got = true;
         }
-        if presses == 0 {
-            return;
-        }
-        // 每次奇数次按下翻转一次（多次累计在一帧内的话相互抵消）
-        for _ in 0..presses {
-            self.toggle_hidden(ctx);
+        if got && !MAIN_HIDDEN.load(Ordering::Acquire) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                if self.cfg.always_on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                },
+            ));
         }
     }
 
@@ -277,11 +369,23 @@ impl NxNoteApp {
         }
         for a in actions {
             match a {
-                crate::tray::TrayAction::Toggle => self.toggle_hidden(ctx),
+                crate::tray::TrayAction::Sync => {
+                    // 后台线程已经 Win32 切换过，self.hidden 在 update() 顶部统一同步
+                    if !MAIN_HIDDEN.load(Ordering::Acquire) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            if self.cfg.always_on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            },
+                        ));
+                    }
+                }
                 crate::tray::TrayAction::Quit => {
                     self.save_current();
                     let _ = self.cfg.save();
                     let _ = self.index.save();
+                    self.force_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -289,10 +393,11 @@ impl NxNoteApp {
     }
 
     fn toggle_hidden(&mut self, ctx: &egui::Context) {
-        if let Some(pos) = self.hidden_pos.take() {
-            // 显示：移回原位 + 取得焦点
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // 转发到全局函数 —— 它从任意线程都能安全调用，会直接走 Win32 + 同步 atomic
+        force_toggle();
+        self.hidden = MAIN_HIDDEN.load(Ordering::Acquire);
+        if !self.hidden {
+            // 恢复后再下发 WindowLevel（隐藏期间可能漂移）
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 if self.cfg.always_on_top {
                     egui::WindowLevel::AlwaysOnTop
@@ -300,18 +405,7 @@ impl NxNoteApp {
                     egui::WindowLevel::Normal
                 },
             ));
-        } else {
-            // 隐藏：记录当前位置 → 移到屏幕外。窗口对系统仍是可见的，
-            // eframe 持续收到事件，下次按热键能可靠地把它移回来。
-            let cur = ctx.input(|i| {
-                i.viewport().outer_rect.map(|r| r.min)
-            });
-            if let Some(p) = cur {
-                self.hidden_pos = Some(p);
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                -32000.0, -32000.0,
-            )));
+            ctx.request_repaint();
         }
     }
 
@@ -373,7 +467,9 @@ impl NxNoteApp {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         if let Ok(handle) = frame.window_handle() {
             if let RawWindowHandle::Win32(w) = handle.as_raw() {
-                self.hwnd_raw = Some(w.hwnd.get());
+                let hwnd = w.hwnd.get();
+                self.hwnd_raw = Some(hwnd);
+                MAIN_HWND.store(hwnd, std::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -498,6 +594,16 @@ impl NxNoteApp {
                             egui::WindowLevel::Normal
                         },
                     ));
+                }
+                if out.close_clicked {
+                    if self.cfg.close_to_tray {
+                        // 隐藏到托盘 —— 文件先存盘，避免下一次启动丢内容
+                        self.save_current();
+                        self.toggle_hidden(ctx);
+                    } else {
+                        self.force_quit = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
 
@@ -719,26 +825,20 @@ impl NxNoteApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let avail = ui.available_size_before_wrap();
-            let line_count = self.editor_text.lines().count().max(1)
+            // 逻辑行数 —— 仅用于估算 gutter 宽度。视觉行号由 galley.rows 决定。
+            let logical_lines = self.editor_text.lines().count().max(1)
                 + if self.editor_text.ends_with('\n') { 1 } else { 0 };
-            let gutter_chars = line_count.to_string().len().max(2);
+            let gutter_chars = logical_lines.to_string().len().max(2);
             let gutter_width = (gutter_chars as f32) * 8.0 + 10.0;
 
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
 
-                // 行号列
-                let mut numbers = String::new();
-                for i in 1..=line_count {
-                    numbers.push_str(&format!("{:>width$}\n", i, width = gutter_chars));
-                }
-                let gutter = egui::RichText::new(numbers)
-                    .monospace()
-                    .color(p.text_weak)
-                    .size(self.cfg.font_size);
-                ui.add_sized(
+                // 行号列：先占位，editor 渲染完拿到 galley.rows 后用 painter 补
+                let gutter_top_left = ui.cursor().left_top();
+                let (_gutter_handle, _) = ui.allocate_exact_size(
                     egui::vec2(gutter_width, 0.0),
-                    egui::Label::new(gutter).wrap_mode(egui::TextWrapMode::Extend),
+                    egui::Sense::hover(),
                 );
 
                 // 分隔线
@@ -833,6 +933,34 @@ impl NxNoteApp {
                     }
                 }
                 self.last_editor_text_len = self.editor_text.len();
+
+                // 行号 gutter —— 用 galley.rows 精确对齐：处理软换行 + 标题行高
+                // 不同的视觉行高问题。每个 source paragraph 的"第一行"画行号，
+                // 软换行续行不画。
+                let gutter_font =
+                    egui::FontId::new(self.cfg.font_size, egui::FontFamily::Monospace);
+                let gutter_x = gutter_top_left.x + gutter_width - 6.0;
+                let gutter_painter = ui.painter();
+                let mut para = 1usize;
+                let mut paint_this = true;
+                for row in &edit_output.galley.rows {
+                    if paint_this {
+                        let y = edit_output.galley_pos.y + row.rect.center().y;
+                        gutter_painter.text(
+                            egui::pos2(gutter_x, y),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{}", para),
+                            gutter_font.clone(),
+                            p.text_weak,
+                        );
+                    }
+                    if row.ends_with_newline {
+                        para += 1;
+                        paint_this = true;
+                    } else {
+                        paint_this = false;
+                    }
+                }
 
                 // 无序列表 - / * / + 渲染为 ·：md_highlight 把 marker 字符整段
                 // 透明保宽，这里在原位画一个圆点 overlay 上去
@@ -1192,6 +1320,11 @@ impl NxNoteApp {
                     self._hotkey = hotkey::install(&self.cfg.hotkey);
                     self.last_bound_hotkey = self.cfg.hotkey.clone();
                 }
+                // autostart 变化则同步注册表
+                if self.cfg.autostart != self.last_applied_autostart {
+                    let _ = crate::autostart::set_enabled(self.cfg.autostart);
+                    self.last_applied_autostart = self.cfg.autostart;
+                }
             }
         }
     }
@@ -1256,6 +1389,31 @@ impl eframe::App for NxNoteApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.capture_hwnd(frame);
 
+        // --hidden 启动：main.rs 已经用 with_visible(false) 创建窗口，
+        // 把全局 atomic 也置位，托盘 / 热键才能 force_show 出来
+        if self.start_hidden_pending.is_some() {
+            self.hidden = true;
+            MAIN_HIDDEN.store(true, Ordering::Release);
+            self.start_hidden_pending = None;
+        }
+
+        // 后台线程可能直接改了窗口可见性（托盘左键 force_show 等），
+        // 每帧把 self.hidden 拉回与 atomic 一致
+        self.hidden = MAIN_HIDDEN.load(Ordering::Acquire);
+
+        // 拦截 OS 关闭请求（Alt+F4 / 任务栏右键关闭等），按 close_to_tray 决定
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.force_quit
+            && self.cfg.close_to_tray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.save_current();
+            // 已隐藏就不重复发命令
+            if !self.hidden {
+                self.toggle_hidden(ctx);
+            }
+        }
+
         // 上一帧排队的列表续行注入到当前帧 events 里，让 TextEdit 自己消费
         if let Some(action) = self.pending_editor_action.take() {
             ctx.input_mut(|i| match action {
@@ -1290,11 +1448,14 @@ impl eframe::App for NxNoteApp {
         self.draw_color_editor_viewport(ctx);
 
         // 编辑器聚焦时连续重绘，最小化输入延迟
-        let focused = ctx.memory(|m| m.focused().is_some());
-        if focused {
-            ctx.request_repaint();
-        } else if self.dirty {
-            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        // 隐藏到托盘时彻底 idle，等 tray/hotkey 主动 request_repaint
+        if !self.hidden {
+            let focused = ctx.memory(|m| m.focused().is_some());
+            if focused {
+                ctx.request_repaint();
+            } else if self.dirty {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
         }
     }
 

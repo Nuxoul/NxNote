@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod chrome;
 mod color_ui;
 mod config;
@@ -31,6 +32,7 @@ fn load_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result<()> {
     let cfg = config::Config::load();
+    let start_hidden = std::env::args().any(|a| a == "--hidden");
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("NxNote")
@@ -50,6 +52,13 @@ fn main() -> eframe::Result<()> {
         viewport
     };
 
+    // --hidden：用 with_visible(false) 真隐藏，任务栏不留图标
+    let viewport = if start_hidden {
+        viewport.with_visible(false)
+    } else {
+        viewport
+    };
+
     let options = eframe::NativeOptions {
         viewport,
         vsync: false,
@@ -62,7 +71,13 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             fonts::install_with_lists(&cc.egui_ctx, &cfg.ui_fonts, &cfg.editor_fonts);
             theme::apply(&cc.egui_ctx, cfg.theme_mode, cfg.font_size);
-            Ok(Box::new(NxNoteApp::new(cc, cfg)))
+            let mut app = NxNoteApp::new(cc, cfg);
+            if start_hidden {
+                // 推迟两帧执行 hide：等 viewport 真正拿到了 outer_rect，
+                // 否则 toggle_hidden 拿不到 current pos，restore 时会丢
+                app.start_hidden_pending = Some(2);
+            }
+            Ok(Box::new(app))
         }),
     )
 }

@@ -20,6 +20,8 @@ pub struct TitleBarConfig<'a> {
 pub struct TitleBarOutput {
     /// 用户点击了"置顶"图标，外部应翻转 cfg.always_on_top 并下发 WindowLevel
     pub on_top_toggled: bool,
+    /// 用户点击了关闭 X。外部根据 close_to_tray 设置决定是真关闭还是隐藏到托盘。
+    pub close_clicked: bool,
 }
 
 /// 自绘标题栏。在调用方分配出来的 rect 内绘制。
@@ -56,7 +58,7 @@ pub fn draw_title_bar(
     let btn_w = 32.0;
     let mut right = rect.right();
 
-    // 关闭按钮
+    // 关闭按钮 —— 关闭策略由外部决定（直接退出 or 隐藏到托盘）
     let close_rect = Rect::from_min_max(pos2(right - btn_w, rect.top()), pos2(right, rect.bottom()));
     if nav_button(
         ui,
@@ -67,7 +69,7 @@ pub fn draw_title_bar(
         Color32::WHITE,
         p.text,
     ) {
-        ctx.send_viewport_cmd(ViewportCommand::Close);
+        out.close_clicked = true;
     }
     right -= btn_w;
 

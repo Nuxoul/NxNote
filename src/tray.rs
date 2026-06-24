@@ -8,7 +8,8 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 #[derive(Debug, Clone, Copy)]
 pub enum TrayAction {
-    Toggle, // 左键单击 / 双击 / "显示/隐藏" 菜单
+    /// 后台线程已经 Win32 改了窗口可见性，main 只需 drain + 同步 self.hidden / 跑一帧
+    Sync,
     Quit,
 }
 
@@ -30,6 +31,9 @@ pub fn install(egui_ctx: egui::Context) -> Option<(TrayHandle, Receiver<TrayActi
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // 左键单击只触发 TrayIconEvent::Click（用于 toggle 显示/隐藏），不弹菜单。
+        // 菜单由右键单击触发。
+        .with_menu_on_left_click(false)
         .with_tooltip("NxNote")
         .with_icon(icon)
         .build()
@@ -45,16 +49,19 @@ pub fn install(egui_ctx: egui::Context) -> Option<(TrayHandle, Receiver<TrayActi
         loop {
             match recv.recv() {
                 Ok(ev) => {
-                    let action = match ev.id.as_ref() {
-                        "nx.toggle" => Some(TrayAction::Toggle),
-                        "nx.quit" => Some(TrayAction::Quit),
-                        _ => None,
-                    };
-                    if let Some(a) = action {
-                        if tx_menu.send(a).is_err() {
-                            break;
+                    match ev.id.as_ref() {
+                        "nx.toggle" => {
+                            // 菜单里点"显示/隐藏" —— 直接 Win32 切换；main 只同步状态
+                            crate::app::force_toggle();
+                            let _ = tx_menu.send(TrayAction::Sync);
+                            ctx_menu.request_repaint();
                         }
-                        ctx_menu.request_repaint();
+                        "nx.quit" => {
+                            let _ = tx_menu.send(TrayAction::Quit);
+                            ctx_menu.request_repaint();
+                            crate::app::wake_event_loop();
+                        }
+                        _ => {}
                     }
                 }
                 Err(_) => break,
@@ -70,7 +77,7 @@ pub fn install(egui_ctx: egui::Context) -> Option<(TrayHandle, Receiver<TrayActi
         loop {
             match recv.recv() {
                 Ok(ev) => {
-                    let toggle = matches!(
+                    let left_click = matches!(
                         ev,
                         TrayIconEvent::Click {
                             button: tray_icon::MouseButton::Left,
@@ -81,10 +88,10 @@ pub fn install(egui_ctx: egui::Context) -> Option<(TrayHandle, Receiver<TrayActi
                             ..
                         }
                     );
-                    if toggle {
-                        if tx_tray.send(TrayAction::Toggle).is_err() {
-                            break;
-                        }
+                    if left_click {
+                        // 左键托盘 = 只显示，不会把已显示的窗口再藏起来
+                        crate::app::force_show();
+                        let _ = tx_tray.send(TrayAction::Sync);
                         ctx_tray.request_repaint();
                     }
                 }

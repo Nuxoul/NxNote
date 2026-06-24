@@ -26,7 +26,7 @@ pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config, current_fg: O
             full.min,
             egui::pos2(full.right(), full.top() + TITLE_BAR_HEIGHT),
         );
-        chrome::draw_title_bar(
+        let tb_out = chrome::draw_title_bar(
             ctx,
             ui,
             title_rect,
@@ -37,6 +37,9 @@ pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config, current_fg: O
                 on_top: None,
             },
         );
+        if tb_out.close_clicked {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // 内容
         let content_rect = Rect::from_min_max(
@@ -180,6 +183,20 @@ fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
                             .suffix(" px"),
                     );
                 });
+            });
+
+            section(ui, "系统", &p, |ui| {
+                row(ui, "开机自启", "登录 Windows 后自动以隐藏态启动", |ui| {
+                    toggle(ui, &mut cfg.autostart);
+                });
+                row(
+                    ui,
+                    "关闭最小化到托盘",
+                    "点关闭 X 或按 Alt+F4 时隐藏到托盘而不是退出（托盘菜单「退出」始终生效）",
+                    |ui| {
+                        toggle(ui, &mut cfg.close_to_tray);
+                    },
+                );
             });
         });
 

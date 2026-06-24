@@ -21,6 +21,8 @@ pub fn spawn_listener(egui_ctx: egui::Context) -> Receiver<()> {
             match receiver.recv() {
                 Ok(ev) => {
                     if ev.state == HotKeyState::Pressed {
+                        // 直接 Win32 切换 —— 不等主线程响应
+                        crate::app::force_toggle();
                         if tx.send(()).is_err() {
                             break;
                         }
