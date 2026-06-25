@@ -57,9 +57,12 @@ pub fn install(egui_ctx: egui::Context) -> Option<(TrayHandle, Receiver<TrayActi
                             ctx_menu.request_repaint();
                         }
                         "nx.quit" => {
+                            // 隐藏状态下 Windows 不派发 WM_PAINT，eframe 的
+                            // update() 不会跑，drain_tray 也就消费不到 Quit。
+                            // 先把窗口拉出来一帧，主循环必跑 → 退出生效
+                            crate::app::force_show();
                             let _ = tx_menu.send(TrayAction::Quit);
                             ctx_menu.request_repaint();
-                            crate::app::wake_event_loop();
                         }
                         _ => {}
                     }

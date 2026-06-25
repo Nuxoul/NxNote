@@ -159,6 +159,9 @@ pub struct NxNoteApp {
     force_quit: bool,
     /// 启动参数带 --hidden：n 帧后调 toggle_hidden（等 viewport 拿到 outer_rect）
     pub start_hidden_pending: Option<u8>,
+    /// IME 上屏期间需要吃掉的 Enter 帧数 —— 防止输入法回车上屏的同一/紧接
+    /// 帧里，TextEdit 也把 Key::Enter 当换行处理
+    ime_swallow_enter: u8,
 }
 
 impl NxNoteApp {
@@ -245,6 +248,7 @@ impl NxNoteApp {
             last_applied_autostart: false, // 在 new 里下面修复
             force_quit: false,
             start_hidden_pending: None,
+            ime_swallow_enter: 0,
         };
         s.last_applied_autostart = s.cfg.autostart;
         s
@@ -385,8 +389,9 @@ impl NxNoteApp {
                     self.save_current();
                     let _ = self.cfg.save();
                     let _ = self.index.save();
-                    self.force_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // 已经手动落盘了，直接结束进程 —— eframe Close 在某些
+                    // 隐藏/无前台路径下不可靠，硬退出最稳
+                    std::process::exit(0);
                 }
             }
         }
@@ -1432,6 +1437,33 @@ impl eframe::App for NxNoteApp {
                     }
                 }
             });
+        }
+
+        // IME 上屏吃 Enter：输入法回车上屏时，winit 同帧也会送一个
+        // Key::Enter 进来，被 TextEdit 当成换行。看到 Ime 事件就把同帧
+        // 以及紧接 1 帧里 pressed 的 Enter 过滤掉。
+        let ime_event = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Ime(_)))
+        });
+        if ime_event {
+            self.ime_swallow_enter = 2;
+        }
+        if self.ime_swallow_enter > 0 {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            });
+            self.ime_swallow_enter -= 1;
         }
 
         self.drain_foreground();
