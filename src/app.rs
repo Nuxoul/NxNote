@@ -95,6 +95,15 @@ enum PendingEditorAction {
     Backspaces(usize),
 }
 
+#[derive(Copy, Clone)]
+enum EditorShortcut {
+    MoveLineUp,
+    MoveLineDown,
+    CopyLineUp,
+    CopyLineDown,
+    DeleteLine,
+}
+
 #[derive(Default, PartialEq, Eq, Clone)]
 enum Modal {
     #[default]
@@ -162,6 +171,9 @@ pub struct NxNoteApp {
     /// IME 上屏期间需要吃掉的 Enter 帧数 —— 防止输入法回车上屏的同一/紧接
     /// 帧里，TextEdit 也把 Key::Enter 当换行处理
     ime_swallow_enter: u8,
+    /// 行级快捷键产生的下一帧光标目标 char idx —— draw_editor 用它覆盖
+    /// TextEditState 里的 cursor，从而让 TextEdit 渲染新位置
+    pending_cursor_char: Option<usize>,
 }
 
 impl NxNoteApp {
@@ -249,6 +261,7 @@ impl NxNoteApp {
             force_quit: false,
             start_hidden_pending: None,
             ime_swallow_enter: 0,
+            pending_cursor_char: None,
         };
         s.last_applied_autostart = s.cfg.autostart;
         s
@@ -554,6 +567,106 @@ impl NxNoteApp {
         let save_now = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
         if save_now {
             self.save_current();
+        }
+    }
+
+    /// 行级快捷键：Alt+↑/↓ 移动行，Alt+Shift+↑/↓ 复制行，Ctrl+Shift+K 删除当前行
+    fn handle_editor_shortcuts(&mut self, ctx: &egui::Context) {
+        // 模态打开时，焦点在弹窗的 text_edit，不能误伤主编辑器
+        if self.modal != Modal::None {
+            return;
+        }
+        let Some((line, col)) = self.editor_cursor_pos else {
+            return;
+        };
+
+        let (action, consumed_key) = ctx.input(|i| {
+            let m = i.modifiers;
+            if m.alt && !m.ctrl {
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    let a = if m.shift {
+                        EditorShortcut::CopyLineUp
+                    } else {
+                        EditorShortcut::MoveLineUp
+                    };
+                    return (Some(a), Some(egui::Key::ArrowUp));
+                }
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    let a = if m.shift {
+                        EditorShortcut::CopyLineDown
+                    } else {
+                        EditorShortcut::MoveLineDown
+                    };
+                    return (Some(a), Some(egui::Key::ArrowDown));
+                }
+            }
+            if m.ctrl && m.shift && !m.alt && i.key_pressed(egui::Key::K) {
+                return (Some(EditorShortcut::DeleteLine), Some(egui::Key::K));
+            }
+            (None, None)
+        });
+        let Some(action) = action else { return };
+
+        let mut lines: Vec<String> =
+            self.editor_text.split('\n').map(String::from).collect();
+        let n = line.min(lines.len().saturating_sub(1));
+
+        let new_pos: (usize, usize) = match action {
+            EditorShortcut::MoveLineUp => {
+                if n == 0 {
+                    return;
+                }
+                lines.swap(n, n - 1);
+                (n - 1, col.min(lines[n - 1].chars().count()))
+            }
+            EditorShortcut::MoveLineDown => {
+                if n + 1 >= lines.len() {
+                    return;
+                }
+                lines.swap(n, n + 1);
+                (n + 1, col.min(lines[n + 1].chars().count()))
+            }
+            EditorShortcut::CopyLineUp => {
+                let dup = lines[n].clone();
+                lines.insert(n, dup);
+                // 光标停在新插入的上一行（即旧 n 位置）
+                (n, col.min(lines[n].chars().count()))
+            }
+            EditorShortcut::CopyLineDown => {
+                let dup = lines[n].clone();
+                lines.insert(n + 1, dup);
+                (n + 1, col.min(lines[n + 1].chars().count()))
+            }
+            EditorShortcut::DeleteLine => {
+                if lines.len() == 1 {
+                    lines[0].clear();
+                    (0, 0)
+                } else {
+                    lines.remove(n);
+                    let nl = n.min(lines.len() - 1);
+                    (nl, 0)
+                }
+            }
+        };
+
+        self.editor_text = lines.join("\n");
+        self.dirty = true;
+        self.last_edit = Some(std::time::Instant::now());
+        self.editor_cursor_pos = Some(new_pos);
+        self.last_editor_text_len = self.editor_text.len();
+        self.pending_cursor_char =
+            Some(char_idx_at_line_col(&self.editor_text, new_pos.0, new_pos.1));
+
+        // 把刚消费的按键从本帧 events 里挖掉，避免 TextEdit 再当一次箭头/字符处理
+        if let Some(k) = consumed_key {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key { key, pressed: true, .. } if *key == k
+                    )
+                });
+            });
         }
     }
 
@@ -876,7 +989,24 @@ impl NxNoteApp {
                     ui.fonts(|f| f.layout_job(job))
                 };
                 let editor_id_salt = "nx_editor_main";
-                let editor_persistent_id = ui.make_persistent_id(editor_id_salt);
+                // TextEdit 内部用的真实 id = ui.make_persistent_id(Id::new(salt))
+                // —— 先 hash 成 Id 再 hash，跟直接 ui.make_persistent_id(salt) 不一样
+                let editor_id =
+                    ui.make_persistent_id(egui::Id::new(editor_id_salt));
+
+                // 行级快捷键产生的目标 cursor：在 show 之前覆盖 state
+                if let Some(target) = self.pending_cursor_char.take() {
+                    use egui::text::{CCursor, CCursorRange};
+                    if let Some(mut state) =
+                        egui::TextEdit::load_state(ui.ctx(), editor_id)
+                    {
+                        state.cursor.set_char_range(Some(CCursorRange::one(
+                            CCursor::new(target),
+                        )));
+                        egui::TextEdit::store_state(ui.ctx(), editor_id, state);
+                    }
+                }
+
                 let edit_output = egui::TextEdit::multiline(&mut self.editor_text)
                     .id_salt(editor_id_salt)
                     .desired_width(editor_w)
@@ -886,7 +1016,6 @@ impl NxNoteApp {
                     .show(ui);
 
                 let resp = edit_output.response;
-                let _ = editor_persistent_id; // 现在用事件注入，不再 store cursor 到 state
                 let new_len = self.editor_text.len();
                 let just_inserted_char = new_len == self.last_editor_text_len + 1;
                 if resp.changed() {
@@ -1472,6 +1601,7 @@ impl eframe::App for NxNoteApp {
         self.enforce_blocklist();
         self.autosave_tick();
         self.handle_keys(ctx);
+        self.handle_editor_shortcuts(ctx);
         self.maybe_reapply_theme(ctx);
         self.update_title_state(ctx);
 
@@ -1553,6 +1683,18 @@ fn continue_list_on_enter(prev_line: &str) -> Option<ListContinuation> {
         )));
     }
     None
+}
+
+fn char_idx_at_line_col(text: &str, line: usize, col: usize) -> usize {
+    let mut total = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        let len = l.chars().count();
+        if i == line {
+            return total + col.min(len);
+        }
+        total += len + 1; // +1 for '\n'
+    }
+    total
 }
 
 fn byte_offset_from_char(text: &str, char_idx: usize) -> usize {
