@@ -1609,15 +1609,11 @@ impl eframe::App for NxNoteApp {
         self.draw_settings_viewport(ctx);
         self.draw_color_editor_viewport(ctx);
 
-        // 编辑器聚焦时连续重绘，最小化输入延迟
-        // 隐藏到托盘时彻底 idle，等 tray/hotkey 主动 request_repaint
-        if !self.hidden {
-            let focused = ctx.memory(|m| m.focused().is_some());
-            if focused {
-                ctx.request_repaint();
-            } else if self.dirty {
-                ctx.request_repaint_after(std::time::Duration::from_millis(300));
-            }
+        // 输入事件本身会唤醒 eframe；聚焦时每帧 request_repaint 会在关闭 vsync
+        // 的情况下形成全速渲染循环。仅在等待自动保存的脏状态下安排低频重绘。
+        // 隐藏到托盘时彻底 idle，等 tray/hotkey 主动 request_repaint。
+        if !self.hidden && self.dirty {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
     }
 
