@@ -211,12 +211,21 @@ fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
         .auto_shrink([false; 2])
         .show(&mut right, |ui| {
             section(ui, "热键", &p, |ui| {
-                row(ui, "全局热键", "点击按钮后按下组合键", |ui| {
+                row(ui, "显示 / 隐藏", "全局呼出 NxNote 的组合键", |ui| {
                     hotkey_recorder(ui, &mut cfg.hotkey);
                 });
                 ui.add_space(2.0);
+                row(
+                    ui,
+                    "速记捕获",
+                    "任意应用里按下后，把剪贴板文本追加进速记本（不抢焦点）",
+                    |ui| {
+                        hotkey_recorder(ui, &mut cfg.hotkey_capture);
+                    },
+                );
+                ui.add_space(2.0);
                 ui.label(
-                    RichText::new("按 Esc 取消录制；按修饰键 + 普通键完成。")
+                    RichText::new("按 Esc 取消录制；需要至少一个修饰键 (Ctrl/Alt/Shift/Win)。")
                         .small()
                         .color(p.text_weak),
                 );
@@ -238,7 +247,7 @@ fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
                             .speed(10),
                     );
                 });
-                row(ui, "前台轮询", "检测前台应用间隔 (ms)", |ui| {
+                row(ui, "前台轮询", "检测前台应用间隔 (ms)，实时生效", |ui| {
                     ui.add(
                         egui::DragValue::new(&mut cfg.poll_interval_ms)
                             .range(100..=5000)
@@ -415,6 +424,11 @@ fn hotkey_recorder(ui: &mut egui::Ui, value: &mut String) {
     let mut recording: bool = ui
         .ctx()
         .memory(|m| m.data.get_temp(id).unwrap_or(false));
+    // 无修饰键的裸键提示（注册成全局热键会吞掉系统所有按键输入，禁止）
+    let warn_id = id.with("warn_nomod");
+    let mut warn_nomod: bool = ui
+        .ctx()
+        .memory(|m| m.data.get_temp(warn_id).unwrap_or(false));
 
     let label_txt = if recording {
         "按下任意组合键…".to_string()
@@ -456,20 +470,41 @@ fn hotkey_recorder(ui: &mut egui::Ui, value: &mut String) {
     let resp = ui.add_sized(btn_size, egui::Button::new(job));
     if resp.clicked() {
         recording = !recording;
+        warn_nomod = false;
     }
 
     if recording {
         if let Some(captured) = capture_hotkey(ui.ctx()) {
-            if captured == "__cancel__" {
-                recording = false;
-            } else {
-                *value = captured;
-                recording = false;
+            match captured.as_str() {
+                "__cancel__" => {
+                    recording = false;
+                    warn_nomod = false;
+                }
+                "__nomod__" => {
+                    // 不退出录制态，提示后继续等
+                    warn_nomod = true;
+                }
+                _ => {
+                    *value = captured;
+                    recording = false;
+                    warn_nomod = false;
+                }
             }
         }
+    } else {
+        warn_nomod = false;
+    }
+
+    if warn_nomod {
+        ui.label(
+            RichText::new("需要至少一个修饰键 (Ctrl/Alt/Shift/Win)")
+                .small()
+                .color(ui.visuals().error_fg_color),
+        );
     }
 
     ui.ctx().memory_mut(|m| m.data.insert_temp(id, recording));
+    ui.ctx().memory_mut(|m| m.data.insert_temp(warn_id, warn_nomod));
 }
 
 fn capture_hotkey(ctx: &egui::Context) -> Option<String> {
@@ -487,6 +522,13 @@ fn capture_hotkey(ctx: &egui::Context) -> Option<String> {
                     return Some("__cancel__".to_string());
                 }
                 if let Some(name) = key_name(*key) {
+                    // 裸键不允许：无修饰键的全局热键会吞掉整个系统的这个按键
+                    // command = ctrl 或 mac_cmd（平台相关），覆盖即可
+                    let m = *modifiers;
+                    let has_mod = m.ctrl || m.alt || m.shift || m.command || m.mac_cmd;
+                    if !has_mod {
+                        return Some("__nomod__".to_string());
+                    }
                     return Some(format_hotkey(*modifiers, name));
                 }
             }

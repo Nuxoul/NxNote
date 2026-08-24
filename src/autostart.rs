@@ -32,8 +32,7 @@ pub fn set_enabled(enable: bool) -> std::io::Result<()> {
             .creation_flags(CREATE_NO_WINDOW)
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!("reg add 退出码 {:?}", status.code()),
             ));
         }

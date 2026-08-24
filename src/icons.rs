@@ -37,3 +37,6 @@ pub const COMPUTER: &str = "\u{E30A}";        // computer
 pub const KEYBOARD: &str = "\u{E312}";        // keyboard
 pub const STAY_ON_TOP: &str = "\u{E25A}";     // vertical_align_top
 pub const COLOR_LENS: &str = "\u{E3B7}";      // color_lens (调色板)
+pub const KEYBOARD_ARROW_UP: &str = "\u{E316}";   // 上箭头
+pub const KEYBOARD_ARROW_DOWN: &str = "\u{E313}"; // 下箭头
+pub const IMAGE: &str = "\u{E3F4}";           // image (图片)

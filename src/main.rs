@@ -6,8 +6,10 @@ mod chrome;
 mod color_ui;
 mod config;
 mod fonts;
+mod fsutil;
 mod hotkey;
 mod icons;
+mod images;
 mod md_highlight;
 mod settings_ui;
 mod storage;
@@ -41,6 +43,13 @@ fn main() -> eframe::Result<()> {
         .with_resizable(true)
         .with_decorations(false)
         .with_transparent(false);
+
+    // 恢复上次窗口位置
+    if let Some([x, y]) = cfg.window_pos {
+        if x.is_finite() && y.is_finite() {
+            viewport = viewport.with_position(egui::pos2(x, y));
+        }
+    }
 
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);

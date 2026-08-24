@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -9,16 +11,17 @@ pub struct ForegroundInfo {
     pub title: String,
 }
 
-pub fn spawn(poll_interval_ms: u64, egui_ctx: egui::Context) -> Receiver<ForegroundInfo> {
+/// poll_interval_ms 用 Arc<AtomicU64> 传递，设置里改了立刻生效，无需重启。
+pub fn spawn(poll_ms: Arc<AtomicU64>, egui_ctx: egui::Context) -> Receiver<ForegroundInfo> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        run(tx, poll_interval_ms, egui_ctx);
+        run(tx, poll_ms, egui_ctx);
     });
     rx
 }
 
 #[cfg(windows)]
-fn run(tx: Sender<ForegroundInfo>, poll_ms: u64, egui_ctx: egui::Context) {
+fn run(tx: Sender<ForegroundInfo>, poll_ms: Arc<AtomicU64>, egui_ctx: egui::Context) {
     use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH};
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -61,14 +64,23 @@ fn run(tx: Sender<ForegroundInfo>, poll_ms: u64, egui_ctx: egui::Context) {
                     };
 
                     let title = {
-                        let len = GetWindowTextLengthW(hwnd);
-                        if len > 0 {
-                            let mut buf = vec![0u16; (len + 1) as usize];
+                        // GetWindowTextLengthW 与 GetWindowTextW 之间标题可能变长，
+                        // 读到截断就把缓冲区翻倍重试
+                        let mut want = GetWindowTextLengthW(hwnd);
+                        let mut title = String::new();
+                        for _ in 0..3 {
+                            if want <= 0 {
+                                break;
+                            }
+                            let mut buf = vec![0u16; (want + 2) as usize];
                             let n = GetWindowTextW(hwnd, &mut buf);
-                            String::from_utf16_lossy(&buf[..n as usize])
-                        } else {
-                            String::new()
+                            if (n as usize) + 1 < buf.len() {
+                                title = String::from_utf16_lossy(&buf[..n as usize]);
+                                break;
+                            }
+                            want = (want * 2).min(8192);
                         }
+                        title
                     };
 
                     exe.map(|exe_path| ForegroundInfo { exe_path, title })
@@ -91,11 +103,12 @@ fn run(tx: Sender<ForegroundInfo>, poll_ms: u64, egui_ctx: egui::Context) {
             }
         }
 
-        thread::sleep(Duration::from_millis(poll_ms));
+        let poll = poll_ms.load(Ordering::Relaxed).max(20);
+        thread::sleep(Duration::from_millis(poll));
     }
 }
 
 #[cfg(not(windows))]
-fn run(_tx: Sender<ForegroundInfo>, _poll_ms: u64, _egui_ctx: egui::Context) {
+fn run(_tx: Sender<ForegroundInfo>, _poll_ms: Arc<AtomicU64>, _egui_ctx: egui::Context) {
     // 其它平台暂未实现
 }

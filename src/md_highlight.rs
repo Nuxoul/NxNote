@@ -4,7 +4,9 @@
 //! - 不在光标行的 `# ** ` [ ]` 等语法标记 字号→0.1pt 不可见也不占位
 //! - 无序列表 `-` `*` `+` 的字符整段透明（保宽度），由 draw_editor 在原位
 //!   overlay 一个 · 字形——所以即使光标在该行，看到的也是 ·
+//! - 任务列表 `- [ ] ` / `- [x] ` 整段透明保宽，draw_editor 在原位画复选框
 //! - 有序列表 `1.` `2.` 始终用 list_marker 颜色（数字本身有内容感）
+//! - `~~删除线~~` 支持；链接区间可经 collect_links() 导出供点击打开
 
 use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, Stroke, TextFormat};
@@ -17,6 +19,8 @@ pub struct Styles<'a> {
     pub p: Palette,
     pub base: f32,
     pub cursor_line: Option<usize>,
+    /// 图片占位字符的字号（撑起图片行行高）；<=0 表示不启用
+    pub img_ph_size: f32,
     pub c: &'a MdColors,
 }
 
@@ -116,6 +120,14 @@ impl<'a> Styles<'a> {
             ..Default::default()
         }
     }
+    fn strike(&self) -> TextFormat {
+        TextFormat {
+            font_id: FontId::new(self.base, FontFamily::Monospace),
+            color: rgb(self.c.text),
+            strikethrough: Stroke::new(1.0, rgb(self.c.syntax)),
+            ..Default::default()
+        }
+    }
     fn link_text(&self) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.base, FontFamily::Monospace),
@@ -152,6 +164,14 @@ impl<'a> Styles<'a> {
             ..Default::default()
         }
     }
+    /// 图片占位字符：透明 + 超大字号 —— 撑起整行行高给内嵌图片留位
+    fn img_placeholder(&self) -> TextFormat {
+        TextFormat {
+            font_id: FontId::new(self.img_ph_size.max(1.0), FontFamily::Monospace),
+            color: Color32::TRANSPARENT,
+            ..Default::default()
+        }
+    }
 }
 
 fn heading_scale(level: u8) -> f32 {
@@ -163,6 +183,42 @@ fn heading_scale(level: u8) -> f32 {
         5 => 1.08,
         _ => 1.04,
     }
+}
+
+/// 任务列表标记：`- [ ] ` / `- [x] ` / `* [X]`。
+/// 返回 (indent_end, 勾选字符字节位, marker_end(含尾随空格), 是否已勾选)
+pub fn task_marker(line: &str) -> Option<(usize, usize, usize, bool)> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i > 8 {
+        return None;
+    }
+    if !matches!(b.get(i), Some(b'-' | b'*' | b'+')) || b.get(i + 1) != Some(&b' ') {
+        return None;
+    }
+    if b.get(i + 2) != Some(&b'[') {
+        return None;
+    }
+    let flag = *b.get(i + 3)?;
+    if flag != b' ' && flag != b'x' && flag != b'X' {
+        return None;
+    }
+    match b.get(i + 4) {
+        Some(b']') => {}
+        _ => return None,
+    }
+    // marker_end："] " 或行尾 "]"
+    let marker_end = if b.get(i + 5) == Some(&b' ') {
+        i + 6
+    } else if i + 5 == b.len() {
+        i + 5
+    } else {
+        return None;
+    };
+    Some((i, i + 3, marker_end, flag != b' '))
 }
 
 pub fn build(text: &str, s: Styles<'_>) -> LayoutJob {
@@ -188,6 +244,70 @@ pub fn build(text: &str, s: Styles<'_>) -> LayoutJob {
         }
     }
     job
+}
+
+/// 整行就是一张图片引用的两种形式：
+/// A) 可选缩进 + ![alt](url)，行尾无其它内容
+/// B) 整行为一个裸图片 URL（png/jpg/... 结尾）
+/// 返回 (行内起始字节, 行内结束字节, url)。
+pub fn image_line_span(line: &str) -> Option<(usize, usize, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 形式 B：裸图片 URL
+    if !trimmed.starts_with("![") && is_image_url(trimmed) {
+        let start = line.len() - line.trim_start().len();
+        return Some((start, start + trimmed.len(), trimmed.to_string()));
+    }
+    // 形式 A：markdown 图片
+    if !trimmed.starts_with("![") {
+        return None;
+    }
+    let ind = line.len() - line.trim_start().len();
+    let b = line.as_bytes();
+    let i = ind;
+    if b.get(i) != Some(&b'!') || b.get(i + 1) != Some(&b'[') {
+        return None;
+    }
+    let (_ct, cu) = find_link(b, i + 1)?;
+    // ]( 之后必须直接到行尾（允许尾随空白）
+    let rest = line[cu + 1..].trim();
+    if !rest.is_empty() {
+        return None;
+    }
+    let raw = &line[i + 2..cu];
+    let url = raw.split_once("](").map(|(_, u)| u.trim().to_string())?;
+    if url.is_empty() {
+        return None;
+    }
+    Some((i, cu + 1, url))
+}
+
+/// 只扫描链接区间（不做排版）。点击编辑器时用，避免依赖 layout 结果。
+/// 返回相对整篇文本的 (byte_start, byte_end_exclusive)。
+pub fn collect_links(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut base = 0usize;
+    for line in text.split('\n') {
+        scan_links(line.as_bytes(), base, &mut out);
+        base += line.len() + 1;
+    }
+    out
+}
+
+fn scan_links(bytes: &[u8], base: usize, out: &mut Vec<(usize, usize)>) {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some((_close_text, close_url)) = find_link(bytes, i) {
+                out.push((base + i, base + close_url + 1));
+                i = close_url + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 fn process_line(
@@ -223,6 +343,33 @@ fn process_line(
     if let Some(rest_idx) = blockquote_prefix(line) {
         job.append(&line[..rest_idx], 0.0, s.quote_marker(on_cursor));
         append_inline_with(job, &line[rest_idx..], s, s.quote(), on_cursor);
+        return;
+    }
+
+    if let Some((ind, _flag_byte, marker_end, _checked)) = task_marker(line) {
+        // 整段 "- [ ] " 透明保宽，draw_editor 在原位画复选框
+        if ind > 0 {
+            job.append(&line[..ind], 0.0, s.normal());
+        }
+        job.append(&line[ind..marker_end], 0.0, s.list_marker_unordered_hidden());
+        append_inline_with(job, &line[marker_end..], s, s.normal(), on_cursor);
+        return;
+    }
+
+    // 整行图片：光标行显示原始 Markdown；非光标行用超大透明字符撑行高，
+    // draw_editor 把真实纹理贴到这块预留区域（Typora 式文内预览）
+    if let Some((sp, ep, _url)) = image_line_span(line) {
+        job.append(&line[..sp], 0.0, s.normal());
+        if on_cursor {
+            job.append(&line[sp..], 0.0, s.syntax(true));
+        } else {
+            // 首字符大字号撑高，其余极小隐形
+            job.append(&line[sp..sp + 1], 0.0, s.img_placeholder());
+            job.append(&line[sp + 1..ep], 0.0, hidden_fmt(FontFamily::Monospace));
+            if line.len() > ep {
+                job.append(&line[ep..], 0.0, s.list_marker_unordered_hidden());
+            }
+        }
         return;
     }
 
@@ -351,6 +498,56 @@ fn ordered_list_marker(line: &str) -> Option<usize> {
     None
 }
 
+/// 判断是否为图片链接（http/https 且扩展名为常见图片格式）。
+pub fn is_image_url(s: &str) -> bool {
+    let t = s.trim();
+    let lower = t.to_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"]
+            .iter()
+            .any(|ext| {
+                lower
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .ends_with(&format!(".{ext}"))
+            })
+}
+
+/// 收集全文中的图片引用：`![alt](url)` 以及"整行就是一个裸图片 URL"两种形式。
+/// 返回 (byte_start, byte_end, url)。
+pub fn collect_images(text: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut base = 0usize;
+    for line in text.split('\n') {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'!' && bytes.get(i + 1) == Some(&b'[') {
+                if let Some((_ct, cu)) = find_link(bytes, i + 1) {
+                    let raw = &line[i + 2..cu]; // alt](url 的内部
+                    if let Some(url) = raw.split_once("](").map(|(_, u)| u.trim().to_string()) {
+                        if !url.is_empty() {
+                            out.push((base + i, base + cu + 1, url));
+                        }
+                    }
+                    i = cu + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        // 裸图片 URL 行
+        let trimmed = line.trim();
+        if is_image_url(trimmed) {
+            let s = line.len() - line.trim_start().len();
+            out.push((base + s, base + line.len(), trimmed.to_string()));
+        }
+        base += line.len() + 1;
+    }
+    out
+}
+
 fn append_inline_with(
     job: &mut LayoutJob,
     text: &str,
@@ -365,6 +562,17 @@ fn append_inline_with(
     while i < bytes.len() {
         let c = bytes[i];
 
+        // ![alt](url) 图片：非光标行整段隐藏保宽（draw_editor 画图片图标芯片）
+        if c == b'!' && bytes.get(i + 1) == Some(&b'[') {
+            if let Some((_ct, cu)) = find_link(bytes, i + 1) {
+                flush(job, text, &mut buf_start, i, &default);
+                let fmt = if on_cursor { s.syntax(true) } else { hidden_fmt(FontFamily::Monospace) };
+                job.append(&text[i..cu + 1], 0.0, fmt);
+                i = cu + 1;
+                buf_start = i;
+                continue;
+            }
+        }
         // `code`
         if c == b'`' {
             if let Some(end) = find_single_char_close(bytes, i + 1, b'`') {
@@ -391,6 +599,20 @@ fn append_inline_with(
                 i = end + 2;
                 buf_start = i;
                 continue;
+            }
+        }
+        // ~~strike~~
+        if c == b'~' && bytes.get(i + 1) == Some(&b'~') {
+            if let Some(end) = find_double_tilde(bytes, i + 2) {
+                if end > i + 2 {
+                    flush(job, text, &mut buf_start, i, &default);
+                    job.append("~~", 0.0, s.syntax(on_cursor));
+                    job.append(&text[i + 2..end], 0.0, s.strike());
+                    job.append("~~", 0.0, s.syntax(on_cursor));
+                    i = end + 2;
+                    buf_start = i;
+                    continue;
+                }
             }
         }
         // *italic*
@@ -461,6 +683,20 @@ fn find_double_star(bytes: &[u8], from: usize) -> Option<usize> {
             return None;
         }
         if bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_double_tilde(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\n' {
+            return None;
+        }
+        if bytes[i] == b'~' && bytes[i + 1] == b'~' {
             return Some(i);
         }
         i += 1;

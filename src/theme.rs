@@ -1,17 +1,16 @@
 use egui::{Color32, Stroke};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum ThemeMode {
     System,
     Light,
+    #[default]
     Dark,
 }
 
-impl Default for ThemeMode {
-    fn default() -> Self {
-        ThemeMode::Dark
-    }
-}
 
 #[derive(Clone, Copy)]
 pub struct Palette {
@@ -64,15 +63,71 @@ enum ResolvedMode {
     Light,
 }
 
+#[cfg(windows)]
+fn system_prefers_light_uncached() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Ok(out) = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return false;
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    // 形如 "    AppsUseLightTheme    REG_DWORD    0x1"
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    toks.iter()
+        .position(|t| *t == "REG_DWORD")
+        .and_then(|i| toks.get(i + 1))
+        .and_then(|v| v.strip_prefix("0x"))
+        .and_then(|v| u32::from_str_radix(v, 16).ok())
+        .map(|v| v == 1)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn system_prefers_light_uncached() -> bool {
+    false
+}
+
+/// 读注册表 AppsUseLightTheme（缓存 2 秒，避免每帧起进程）。
+pub fn system_prefers_light() -> bool {
+    static CACHE: OnceLock<Mutex<(Instant, bool)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(10), false)));
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if guard.0.elapsed() >= Duration::from_secs(2) {
+        guard.1 = system_prefers_light_uncached();
+        guard.0 = Instant::now();
+    }
+    guard.1
+}
+
 fn resolve(mode: ThemeMode) -> ResolvedMode {
     match mode {
         ThemeMode::Light => ResolvedMode::Light,
         ThemeMode::Dark => ResolvedMode::Dark,
         ThemeMode::System => {
-            // 简单回退：默认深色
-            ResolvedMode::Dark
+            if system_prefers_light() {
+                ResolvedMode::Light
+            } else {
+                ResolvedMode::Dark
+            }
         }
     }
+}
+
+/// 解析后的实际模式是否为浅色（System 会查系统设置）。
+pub fn resolved_is_light(mode: ThemeMode) -> bool {
+    matches!(resolve(mode), ResolvedMode::Light)
 }
 
 pub fn apply(ctx: &egui::Context, mode: ThemeMode, font_size: f32) {

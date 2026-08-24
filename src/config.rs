@@ -74,9 +74,15 @@ pub struct Config {
     pub theme_mode: ThemeMode,
     pub window_width: f32,
     pub window_height: f32,
+    /// 上次窗口位置（外框左上角），退出/隐藏时更新，启动时恢复
+    #[serde(default)]
+    pub window_pos: Option<[f32; 2]>,
     pub always_on_top: bool,
     pub font_size: f32,
     pub hotkey: String,
+    /// 剪贴板快速捕获热键：按下后把剪贴板文本追加进速记本
+    #[serde(default = "default_hotkey_capture")]
+    pub hotkey_capture: String,
     pub autosave_delay_ms: u64,
     pub poll_interval_ms: u64,
     #[serde(default)]
@@ -107,6 +113,10 @@ fn default_close_to_tray() -> bool {
     true
 }
 
+fn default_hotkey_capture() -> String {
+    "Ctrl+Alt+Shift+C".to_string()
+}
+
 fn default_autohide() -> bool {
     true
 }
@@ -117,9 +127,11 @@ impl Default for Config {
             theme_mode: ThemeMode::Dark,
             window_width: 256.0,
             window_height: 256.0,
+            window_pos: None,
             always_on_top: false,
             font_size: 13.0,
             hotkey: "Ctrl+Alt+N".to_string(),
+            hotkey_capture: default_hotkey_capture(),
             autosave_delay_ms: 1500,
             poll_interval_ms: 500,
             ui_fonts: Vec::new(),
@@ -150,7 +162,7 @@ impl Config {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let s = toml::to_string_pretty(self)?;
-        std::fs::write(config_path(), s)?;
+        crate::fsutil::write_atomic(&config_path(), s.as_bytes())?;
         Ok(())
     }
 }
