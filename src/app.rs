@@ -96,6 +96,11 @@ enum PendingEditorAction {
     Backspaces(usize),
 }
 
+/// 撤销爆发窗口：间隔小于此值的连续变化并成一步撤销（egui 内建是 1s，太粗）
+const UNDO_BURST_INTERVAL_MS: u64 = 400;
+/// 撤销栈上限（条）
+const UNDO_MAX_ENTRIES: usize = 100;
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum EditorShortcut {
     MoveBlockUp,
@@ -200,6 +205,16 @@ pub struct NxNoteApp {
     /// 行级快捷键 / 搜索跳转产生的下一帧光标目标（anchor, primary），char idx。
     /// draw_editor 用它覆盖 TextEditState 里的 cursor，从而保留选区渲染新位置
     pending_cursor_range: Option<(usize, usize)>,
+    /// 自管撤销栈 (文本, 主光标 char idx)。egui 内建 undo 以 1s 稳定期为界，
+    /// 快速连打/连续 IME 上屏会整段回退，太粗；这里按输入爆发(400ms 间隔)切点
+    undo_stack: Vec<(String, usize)>,
+    redo_stack: Vec<(String, usize)>,
+    /// 上一帧的编辑器文本（用于检测变化、做爆发起点的前置快照）
+    undo_last_seen: String,
+    /// 上一帧的主光标 char idx
+    undo_last_seen_cursor: usize,
+    /// 最近一次文本变化的时刻（间隔 < 爆发窗口的变化并成一步撤销）
+    undo_last_change: Option<Instant>,
     /// 主编辑器 TextEdit 的真实持久 Id（首帧从 response.id 捕获），
     /// 快捷键在 draw 前读 TextEditState 需要它
     editor_text_id: Option<egui::Id>,
@@ -277,6 +292,7 @@ impl NxNoteApp {
 
         let last_bound_hotkey = cfg.hotkey.clone();
         let last_bound_capture = cfg.hotkey_capture.clone();
+        let undo_last_seen = editor_text.clone();
 
         let mut s = Self {
             cfg,
@@ -328,6 +344,11 @@ impl NxNoteApp {
             start_hidden_pending: None,
             ime_swallow_enter: 0,
             pending_cursor_range: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_last_seen,
+            undo_last_seen_cursor: 0,
+            undo_last_change: None,
             editor_text_id: None,
             reset_editor_state: false,
             search_open: false,
@@ -365,6 +386,11 @@ impl NxNoteApp {
         self.last_edit = None;
         // 切了笔记：清掉旧光标/撤销栈，避免越界或串味
         self.reset_editor_state = true;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_last_seen = self.editor_text.clone();
+        self.undo_last_seen_cursor = 0;
+        self.undo_last_change = None;
         // 持久化"上次界面"，方便启动时回到这里
         self.index.last_folder_key = Some(self.folder_key.clone());
         self.index.last_note_name = Some(self.note_name.clone());
@@ -757,14 +783,23 @@ impl NxNoteApp {
 
         let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let pointer_held = ctx.input(|i| i.pointer.any_down());
-        let mouse_in = ctx.input(|i| i.pointer.hover_pos().is_some());
-        // 编辑器（或任何控件）正在被聚焦 → 保留标题栏，避免输入中段途切换
-        let any_focus = ctx.memory(|m| m.focused().is_some());
+        // 只有鼠标移到窗口顶部窄条才唤出标题栏（移入软件其他区域不算）。
+        // 已显示时放宽到整个标题栏高度，避免在标题栏内下移几像素就收起。
+        let pointer_top = ctx.input(|i| {
+            i.pointer.hover_pos().map_or(false, |p| {
+                let limit = if self.title_visible {
+                    crate::chrome::TITLE_BAR_HEIGHT + 6.0
+                } else {
+                    10.0
+                };
+                p.y <= limit
+            })
+        });
 
-        let want = if !self.cfg.autohide_title_bar || maxed || pointer_held || any_focus {
+        let want = if !self.cfg.autohide_title_bar || maxed {
             true
         } else {
-            mouse_in
+            pointer_top || (pointer_held && self.title_visible)
         };
 
         // 滞后：show 立即；hide 等 220ms，避免鼠标短暂出界就抖动
@@ -816,6 +851,35 @@ impl NxNoteApp {
         if ctrl_p && self.modal == Modal::None {
             self.modal = Modal::QuickSwitch { query: String::new(), sel: 0 };
             consume_key(ctx, egui::Key::P);
+        }
+
+        // 自管撤销/重做：egui 内建 undo 以 1s 稳定期为界，快速连打会整段回退。
+        // 编辑器聚焦时拦下 Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z 走自己的栈（见 update_editor_history）
+        let (undo_key, redo_key) = ctx.input(|i| {
+            let c = i.modifiers.ctrl;
+            (
+                c && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                (c && !i.modifiers.shift && i.key_pressed(egui::Key::Y))
+                    || (c && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
+            )
+        });
+        if self.modal == Modal::None && (undo_key || redo_key) {
+            let editor_focused = self.editor_text_id.is_some()
+                && ctx.memory(|m| m.focused()) == self.editor_text_id;
+            if editor_focused {
+                let current = (self.editor_text.clone(), self.undo_last_seen_cursor);
+                let target = if undo_key {
+                    self.history_undo(current)
+                } else {
+                    self.history_redo(current)
+                };
+                if let Some((text, cur)) = target {
+                    self.apply_history_state(text, cur);
+                }
+                // 即使栈空也吃掉按键，避免落回 egui 的粗粒度 undo
+                consume_key(ctx, egui::Key::Z);
+                consume_key(ctx, egui::Key::Y);
+            }
         }
 
         // 标签页：Ctrl+PgDn/PgUp 循环切换，Ctrl+数字 直达，Ctrl+W 关闭。
@@ -1084,6 +1148,83 @@ impl NxNoteApp {
         if let Some(k) = consumed_key {
             consume_key(ctx, k);
         }
+    }
+
+    /// 每帧检测编辑器文本变化，按"输入爆发"记录撤销点：
+    /// 一段间隔都 < 400ms 的连续变化并成一步；停顿后 或 行级快捷键等
+    /// 程序性修改 会开启新的爆发。在 draw 之前跑（TextEdit 的按键在 draw 里消费）。
+    fn update_editor_history(&mut self, ctx: &egui::Context) {
+        // 光标每帧跟随（此时读到的是上一帧的位置，正好是本轮变化前的光标）
+        if let Some(id) = self.editor_text_id {
+            if let Some(st) = egui::TextEdit::load_state(ctx, id) {
+                if let Some(r) = st.cursor.char_range() {
+                    self.undo_last_seen_cursor = r.primary.index;
+                }
+            }
+        }
+        if self.editor_text == self.undo_last_seen {
+            return;
+        }
+        let burst_boundary = match self.undo_last_change {
+            None => true,
+            Some(t) => t.elapsed().as_millis() >= UNDO_BURST_INTERVAL_MS as u128,
+        };
+        if burst_boundary {
+            let prev = std::mem::take(&mut self.undo_last_seen);
+            let cursor = self.undo_last_seen_cursor;
+            // 同文本不重复入栈（撤销后原样重打等场景）
+            if self
+                .undo_stack
+                .last()
+                .map(|(t, _)| t != &prev)
+                .unwrap_or(true)
+            {
+                self.undo_stack.push((prev, cursor));
+                if self.undo_stack.len() > UNDO_MAX_ENTRIES {
+                    self.undo_stack.remove(0);
+                }
+                self.redo_stack.clear();
+            }
+        }
+        self.undo_last_seen = self.editor_text.clone();
+        self.undo_last_change = Some(Instant::now());
+    }
+
+    /// 当前 (文本, 光标) 入参；返回要恢复的上一步，没有则 None。
+    fn history_undo(&mut self, current: (String, usize)) -> Option<(String, usize)> {
+        if self.undo_stack.is_empty() {
+            return None;
+        }
+        if self.undo_stack.last() == Some(&current) {
+            self.redo_stack.push(self.undo_stack.pop().unwrap());
+        } else {
+            self.redo_stack.push(current);
+        }
+        self.undo_stack.last().cloned()
+    }
+
+    fn history_redo(&mut self, current: (String, usize)) -> Option<(String, usize)> {
+        if !self.undo_stack.is_empty() && self.undo_stack.last() != Some(&current) {
+            // 撤销后产生了新编辑，redo 序列作废
+            self.redo_stack.clear();
+            return None;
+        }
+        let next = self.redo_stack.pop()?;
+        self.undo_stack.push(next.clone());
+        Some(next)
+    }
+
+    fn apply_history_state(&mut self, text: String, cursor: usize) {
+        self.editor_text = text;
+        self.undo_last_seen = self.editor_text.clone();
+        self.undo_last_seen_cursor = cursor;
+        self.undo_last_change = None;
+        self.dirty = true;
+        self.last_edit = Some(Instant::now());
+        self.last_editor_text_len = self.editor_text.len();
+        let (line, col) = char_to_line_col(&self.editor_text, cursor);
+        self.editor_cursor_pos = Some((line, col));
+        self.pending_cursor_range = Some((cursor, cursor));
     }
 
     fn draw_main_frame(&mut self, ctx: &egui::Context) {
@@ -2794,6 +2935,7 @@ impl eframe::App for NxNoteApp {
         self.autosave_tick();
         self.handle_keys(ctx);
         self.handle_editor_shortcuts(ctx);
+        self.update_editor_history(ctx);
         self.maybe_reapply_theme(ctx);
         self.update_title_state(ctx);
 
