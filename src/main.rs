@@ -33,6 +33,18 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // --data-dir <path>：数据目录覆盖（便携模式 / 隔离测试），必须在加载配置前生效
+    {
+        let mut args = std::env::args().skip(1);
+        while let Some(a) = args.next() {
+            if a == "--data-dir" {
+                if let Some(dir) = args.next() {
+                    config::set_data_dir_override(std::path::PathBuf::from(dir));
+                }
+            }
+        }
+    }
+
     let cfg = config::Config::load();
     let start_hidden = std::env::args().any(|a| a == "--hidden");
 

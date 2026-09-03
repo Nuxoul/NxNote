@@ -79,7 +79,7 @@ pub fn force_show() {}
 pub fn force_hide() {}
 #[cfg(not(windows))]
 pub fn force_toggle() {}
-use crate::config::Config;
+use crate::config::{Config, OpenTab};
 use crate::fonts;
 use crate::hotkey;
 use crate::icons;
@@ -160,6 +160,10 @@ pub struct NxNoteApp {
     dirty: bool,
     last_edit: Option<Instant>,
 
+    /// 打开的标签页；tabs[active_tab] 始终与当前 folder_key/note_name 一致
+    tabs: Vec<OpenTab>,
+    active_tab: usize,
+
     pinned: bool,
     modal: Modal,
     /// 是否已经"最小化到托盘"（窗口对 Windows 不可见，taskbar 上也没图标）
@@ -237,8 +241,33 @@ impl NxNoteApp {
         };
 
         let index = AppIndex::load();
-        let (folder_key, display_name, note_name) = storage::resolve_startup(&index);
-        let editor_text = storage::load_note(&folder_key, &note_name);
+        let (startup_folder, startup_display, startup_note) = storage::resolve_startup(&index);
+        // 恢复上次打开的标签页：去重 + 丢弃文件已不存在的；全部失效则退回上次笔记
+        let mut tabs: Vec<OpenTab> = Vec::new();
+        for t in &cfg.open_tabs {
+            if tabs.contains(t) {
+                continue;
+            }
+            if t.folder_key == storage::GLOBAL_FOLDER
+                || storage::note_path(&t.folder_key, &t.note_name).exists()
+            {
+                tabs.push(t.clone());
+            }
+        }
+        let (folder_key, display_name, note_name, editor_text, active_tab) = if tabs.is_empty() {
+            let text = storage::load_note(&startup_folder, &startup_note);
+            tabs.push(OpenTab {
+                folder_key: startup_folder.clone(),
+                note_name: startup_note.clone(),
+            });
+            (startup_folder, startup_display, startup_note, text, 0usize)
+        } else {
+            let idx = cfg.active_tab.min(tabs.len() - 1);
+            let cur = tabs[idx].clone();
+            let display = display_name_for(&index, &cur.folder_key);
+            let text = storage::load_note(&cur.folder_key, &cur.note_name);
+            (cur.folder_key, display, cur.note_name, text, idx)
+        };
 
         let last_applied_theme = cfg.theme_mode;
         let last_applied_font = cfg.font_size;
@@ -275,6 +304,8 @@ impl NxNoteApp {
             editor_text,
             dirty: false,
             last_edit: None,
+            tabs,
+            active_tab,
             pinned: false,
             modal: Modal::None,
             hidden: false,
@@ -339,6 +370,90 @@ impl NxNoteApp {
         self.index.last_note_name = Some(self.note_name.clone());
         self.index.last_display_name = Some(self.display_name.clone());
         let _ = self.index.save();
+        // 标签页同步：已开 → 激活；未开 → 追加为最后一个。所有切换路径
+        // （菜单 / 快速切换 / 自动跟随 / 新建 / 重命名）都经过这里
+        let (fk, nn) = (self.folder_key.clone(), self.note_name.clone());
+        self.sync_tab_open(&fk, &nn);
+    }
+
+    fn sync_tab_open(&mut self, folder_key: &str, note_name: &str) {
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.folder_key == folder_key && t.note_name == note_name)
+        {
+            if self.active_tab != i {
+                self.active_tab = i;
+                self.persist_tabs();
+            }
+        } else {
+            self.tabs.push(OpenTab {
+                folder_key: folder_key.to_string(),
+                note_name: note_name.to_string(),
+            });
+            self.active_tab = self.tabs.len() - 1;
+            self.persist_tabs();
+        }
+    }
+
+    /// tabs 变化写回 cfg；磁盘落盘走 cfg_save_pending 去抖（退出时另有兜底保存）
+    fn persist_tabs(&mut self) {
+        self.cfg.open_tabs = self.tabs.clone();
+        self.cfg.active_tab = self.active_tab;
+        self.cfg_save_pending = Some(Instant::now());
+    }
+
+    fn activate_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let t = self.tabs[idx].clone();
+        let display = display_name_for(&self.index, &t.folder_key);
+        self.switch_to(t.folder_key, display, t.note_name);
+    }
+
+    /// 关闭标签页。至少保留一个：当前视图必须落在某个笔记上。
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            self.set_status("至少保留一个标签页".to_string());
+            return;
+        }
+        let was_active = idx == self.active_tab;
+        self.tabs.remove(idx);
+        if self.active_tab > idx {
+            self.active_tab -= 1;
+        }
+        if was_active {
+            // 激活补位 tab：remove 后 idx 即原后继，末尾则取新长度-1
+            self.active_tab = idx.min(self.tabs.len() - 1);
+        }
+        self.persist_tabs();
+        if was_active {
+            let t = self.tabs[self.active_tab].clone();
+            let display = display_name_for(&self.index, &t.folder_key);
+            self.switch_to(t.folder_key, display, t.note_name);
+        }
+    }
+
+    fn cycle_tab(&mut self, delta: isize) {
+        let n = self.tabs.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let idx = (self.active_tab as isize + delta).rem_euclid(n) as usize;
+        self.activate_tab(idx);
+    }
+
+    /// 标签标题：内置速记本显示中文名，其余用笔记名
+    fn tab_title(&self, t: &OpenTab) -> String {
+        if t.folder_key == storage::GLOBAL_FOLDER && t.note_name == storage::SCRATCH_NOTE {
+            "速记".to_string()
+        } else {
+            t.note_name.clone()
+        }
     }
 
     fn handle_foreground_change(&mut self, info: ForegroundInfo) {
@@ -604,6 +719,14 @@ impl NxNoteApp {
             }
         }
         let _ = self.index.save();
+        // 指向被删笔记的标签页一并移除，active_tab 收敛到合法范围；
+        // 随后的 switch_to 会激活兜底笔记所在的 tab
+        self.tabs
+            .retain(|t| !(t.folder_key == folder && t.note_name == old_name));
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
+        self.persist_tabs();
         let fallback_note = if folder == GLOBAL_FOLDER {
             SCRATCH_NOTE
         } else {
@@ -694,6 +817,78 @@ impl NxNoteApp {
             self.modal = Modal::QuickSwitch { query: String::new(), sel: 0 };
             consume_key(ctx, egui::Key::P);
         }
+
+        // 标签页：Ctrl+PgDn/PgUp 循环切换，Ctrl+数字 直达，Ctrl+W 关闭。
+        // 不用 Ctrl+Tab：egui 的 begin_pass 会无视修饰键把 Tab 拿去做焦点导航，
+        // 发生在 update 之前，consume 掉也拦不住焦点跳走。
+        let (tab_next, tab_prev, tab_close) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::PageDown),
+                i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::PageUp),
+                i.modifiers.ctrl && i.key_pressed(egui::Key::W),
+            )
+        });
+        let tab_num = if self.modal == Modal::None {
+            ctx.input(|i| {
+                if !i.modifiers.ctrl {
+                    return None;
+                }
+                for (n, k) in [
+                    (1usize, egui::Key::Num1),
+                    (2, egui::Key::Num2),
+                    (3, egui::Key::Num3),
+                    (4, egui::Key::Num4),
+                    (5, egui::Key::Num5),
+                    (6, egui::Key::Num6),
+                    (7, egui::Key::Num7),
+                    (8, egui::Key::Num8),
+                    (9, egui::Key::Num9),
+                ] {
+                    if i.key_pressed(k) {
+                        return Some(n - 1);
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+        if self.modal == Modal::None {
+            let mut acted = false;
+            if tab_next {
+                self.cycle_tab(1);
+                acted = true;
+            } else if tab_prev {
+                self.cycle_tab(-1);
+                acted = true;
+            } else if tab_close {
+                self.close_tab(self.active_tab);
+                acted = true;
+            } else if let Some(n) = tab_num {
+                self.activate_tab(n);
+                acted = true;
+            }
+            if acted {
+                // 防止 PgUp/PgDn 等再被 TextEdit/滚动当一次处理
+                for k in [
+                    egui::Key::PageDown,
+                    egui::Key::PageUp,
+                    egui::Key::W,
+                    egui::Key::Num1,
+                    egui::Key::Num2,
+                    egui::Key::Num3,
+                    egui::Key::Num4,
+                    egui::Key::Num5,
+                    egui::Key::Num6,
+                    egui::Key::Num7,
+                    egui::Key::Num8,
+                    egui::Key::Num9,
+                ] {
+                    consume_key(ctx, k);
+                }
+            }
+        }
+
         if save_now {
             self.set_status("已保存".to_string());
         }
@@ -967,9 +1162,24 @@ impl NxNoteApp {
             );
             self.draw_status_bar_at(ui, status_rect);
 
+            // 标签栏：常显 —— 只有一个标签也展示，启动即可见，不用等打开第二个
+            let tab_h = 26.0;
+            let tab_rect = egui::Rect::from_min_max(
+                egui::pos2(full.left(), tool_rect.bottom()),
+                egui::pos2(full.right(), tool_rect.bottom() + tab_h),
+            );
+            {
+                let mut tab_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(tab_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                self.draw_tab_bar(&mut tab_ui);
+            }
+
             // 中部
             let content_rect = egui::Rect::from_min_max(
-                egui::pos2(full.left(), tool_rect.bottom()),
+                egui::pos2(full.left(), tab_rect.bottom()),
                 egui::pos2(full.right(), status_rect.top()),
             )
             .shrink2(egui::vec2(6.0, 4.0));
@@ -1108,6 +1318,102 @@ impl NxNoteApp {
                 self.settings_pos_applied = false;
             }
         });
+    }
+
+    /// 标签条：左对齐的页签，激活项有底色 + accent 下划线，悬停出现关闭 X，
+    /// 中键点击也可关闭。宽度按数量均分（64~150px），超长标题截断。
+    fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let p = palette(self.cfg.theme_mode);
+        let strip = ui.max_rect();
+        let n = self.tabs.len();
+        let per_tab = ((strip.width() - 8.0) / n as f32).clamp(64.0, 150.0);
+        let font_id = egui::FontId::proportional(12.0);
+        let rounding = egui::Rounding {
+            nw: 5.0,
+            ne: 5.0,
+            sw: 0.0,
+            se: 0.0,
+        };
+
+        for i in 0..n {
+            let t = self.tabs[i].clone();
+            let active = i == self.active_tab;
+            let title = self.tab_title(&t);
+
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(per_tab, strip.height() - 2.0),
+                egui::Sense::click(),
+            );
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+            if active {
+                ui.painter().rect_filled(rect, rounding, p.bg_alt);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, rounding, p.hover);
+            }
+            if active {
+                let line = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 5.0, strip.bottom() - 2.0),
+                    egui::pos2(rect.right() - 5.0, strip.bottom()),
+                );
+                ui.painter().rect_filled(line, 0.0, p.accent);
+            }
+
+            // 标题：右侧留出 X 的位置
+            let shown = truncate_to_fit(ui, &title, rect.width() - 26.0, font_id.clone());
+            let color = if active { p.text } else { p.text_weak };
+            ui.painter().text(
+                egui::pos2(rect.left() + 9.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                shown,
+                font_id.clone(),
+                color,
+            );
+
+            // 关闭 X：激活或悬停时出现。先于整页签处理，点击不会顺带切页
+            if active || resp.hovered() {
+                let cx = rect.right() - 10.0;
+                let x_rect = egui::Rect::from_center_size(
+                    egui::pos2(cx, rect.center().y),
+                    egui::vec2(16.0, 16.0),
+                );
+                let x_resp =
+                    ui.interact(x_rect, ui.id().with(("tab_close", i)), egui::Sense::click());
+                let x_color = if x_resp.hovered() {
+                    p.text_strong
+                } else {
+                    p.text_weak
+                };
+                ui.painter().text(
+                    egui::pos2(cx, rect.center().y),
+                    egui::Align2::CENTER_CENTER,
+                    icons::CLOSE,
+                    icons::font(11.0),
+                    x_color,
+                );
+                if x_resp.clicked() {
+                    self.close_tab(i);
+                    return;
+                }
+            }
+
+            if resp.middle_clicked() {
+                self.close_tab(i);
+                return;
+            }
+            if resp.clicked() {
+                self.activate_tab(i);
+            }
+        }
+
+        // 条底分隔线，把页签区和正文分开
+        ui.painter().line_segment(
+            [
+                egui::pos2(strip.left(), strip.bottom() - 0.5),
+                egui::pos2(strip.right(), strip.bottom() - 0.5),
+            ],
+            egui::Stroke::new(1.0, p.stroke),
+        );
     }
 
     fn draw_status_bar_at(&self, ui: &egui::Ui, rect: egui::Rect) {
@@ -1903,6 +2209,13 @@ impl NxNoteApp {
                                             }
                                         }
                                         let _ = self.index.save();
+                                        // 标签页里的旧名同步改掉，避免残留死 tab
+                                        for t in &mut self.tabs {
+                                            if t.folder_key == folder && t.note_name == old {
+                                                t.note_name = new_name.clone();
+                                            }
+                                        }
+                                        self.persist_tabs();
                                         // 注意：不要手动改 self.note_name，
                                         // 让 switch_to 完整走一遍（含 last_* 持久化）
                                         self.switch_to(folder, display, new_name);
@@ -2864,6 +3177,19 @@ fn app_blocked(blocked: &[String], exe: &std::path::Path) -> bool {
         }
         false
     })
+}
+
+/// 文件夹显示名：全局文件夹叫「速记」，其余取索引里的应用名，兜底用 key 本身。
+/// new() 里还没有 self 时也要用，所以是自由函数。
+fn display_name_for(index: &AppIndex, folder_key: &str) -> String {
+    if folder_key == storage::GLOBAL_FOLDER {
+        return "速记".to_string();
+    }
+    index
+        .apps
+        .get(folder_key)
+        .map(|e| e.display_name.clone())
+        .unwrap_or_else(|| folder_key.to_string())
 }
 
 fn truncate_to_fit(ui: &egui::Ui, text: &str, max_w: f32, font_id: egui::FontId) -> String {

@@ -58,7 +58,25 @@ fn default_md_light() -> MdColors {
     MdColors::default_light()
 }
 
+/// 一个打开的标签页 = (所属文件夹, 笔记名)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenTab {
+    pub folder_key: String,
+    pub note_name: String,
+}
+
+/// --data-dir 覆盖（便携模式 / 隔离测试）。main 里在 Config::load 之前设置。
+static DATA_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_data_dir_override(dir: PathBuf) {
+    let _ = DATA_DIR_OVERRIDE.set(dir);
+}
+
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = DATA_DIR_OVERRIDE.get() {
+        let _ = std::fs::create_dir_all(dir);
+        return dir.clone();
+    }
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("NxNote");
     let _ = std::fs::create_dir_all(&dir);
@@ -107,6 +125,12 @@ pub struct Config {
     /// 关闭按钮 / Alt+F4 时最小化到托盘而不是退出
     #[serde(default = "default_close_to_tray")]
     pub close_to_tray: bool,
+    /// 打开的标签页（退出时落盘，启动时恢复）
+    #[serde(default)]
+    pub open_tabs: Vec<OpenTab>,
+    /// 激活的标签页下标（越界时启动时会被 clamp）
+    #[serde(default)]
+    pub active_tab: usize,
 }
 
 fn default_close_to_tray() -> bool {
@@ -143,6 +167,8 @@ impl Default for Config {
             md_light: MdColors::default_light(),
             autostart: false,
             close_to_tray: true,
+            open_tabs: Vec::new(),
+            active_tab: 0,
         }
     }
 }
