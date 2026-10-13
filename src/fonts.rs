@@ -2,12 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const DEFAULT_CANDIDATES: &[&str] = &[
-    "msyh.ttc", "msyh.ttf", "msyhbd.ttc", "Deng.ttf", "simhei.ttf", "simsun.ttc",
-];
-
-const MATERIAL_ICONS: &[u8] = include_bytes!("../assets/MaterialIcons-Regular.ttf");
-
 fn system_fonts_dir() -> PathBuf {
     std::env::var_os("WINDIR")
         .map(PathBuf::from)
@@ -17,22 +11,6 @@ fn system_fonts_dir() -> PathBuf {
 
 fn user_fonts_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|p| p.join("Microsoft").join("Windows").join("Fonts"))
-}
-
-fn find_default_cjk() -> Option<(String, Vec<u8>)> {
-    let dir = system_fonts_dir();
-    for name in DEFAULT_CANDIDATES {
-        let p = dir.join(name);
-        if let Ok(bytes) = std::fs::read(&p) {
-            return Some((name.to_string(), bytes));
-        }
-    }
-    None
-}
-
-fn default_cjk() -> Option<(&'static str, &'static [u8])> {
-    static CACHE: OnceLock<Option<(String, Vec<u8>)>> = OnceLock::new();
-    CACHE.get_or_init(find_default_cjk).as_ref().map(|(n, b)| (n.as_str(), b.as_slice()))
 }
 
 /// 枚举系统已安装字体（系统目录 + 当前用户目录）。
@@ -129,70 +107,18 @@ pub fn font_display_name(path: &Path) -> String {
     name
 }
 
-fn load_user_font(path: &str) -> Option<(String, Vec<u8>)> {
-    let bytes = std::fs::read(path).ok()?;
-    let display = font_display_name(Path::new(path));
-    Some((display.replace([' ', '\t'], "_"), bytes))
-}
-
-/// 安装字体：UI 字体（列表前者优先）写入 Proportional，编辑器字体写入 Monospace；
-/// 默认 CJK 与图标字体作为最终兜底。
-pub fn install_with_lists(ctx: &egui::Context, ui_fonts: &[String], editor_fonts: &[String]) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    // 工具：把一组字体路径按顺序插入指定 family
-    let mut push_into = |family: egui::FontFamily, paths: &[String], key_prefix: &str| {
-        for (i, path) in paths.iter().enumerate() {
-            if let Some((name, bytes)) = load_user_font(path) {
-                let key = format!("{}_{}_{}", key_prefix, i, name);
-                fonts
-                    .font_data
-                    .insert(key.clone(), egui::FontData::from_owned(bytes));
-                fonts.families.entry(family.clone()).or_default().insert(i, key);
-            }
-        }
-    };
-
-    push_into(egui::FontFamily::Proportional, ui_fonts, "ui");
-    push_into(egui::FontFamily::Monospace, editor_fonts, "editor");
-
-    // 默认 CJK 字体作为兜底
-    if let Some((name, bytes)) = default_cjk() {
-        let key = format!("default_cjk_{name}");
-        fonts
-            .font_data
-            .insert(key.clone(), egui::FontData::from_static(bytes));
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push(key.clone());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push(key);
+/// GPUI uses installed families; load configured font files to preserve portable settings.
+pub fn install(cfg: &crate::config::Config, cx: &mut gpui_kit::App) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let mut data = Vec::new();
+    for path in cfg.ui_fonts.iter().chain(&cfg.editor_fonts) {
+        let bytes = std::fs::read(path).with_context(|| format!("无法读取字体 {path}"))?;
+        ttf_parser::Face::parse(&bytes, 0)
+            .map_err(|e| anyhow::anyhow!("无效字体 {path}: {e:?}"))?;
+        data.push(std::borrow::Cow::Owned(bytes));
     }
-
-    // 图标字体
-    let icon_key = crate::icons::ICON_FAMILY.to_string();
-    fonts
-        .font_data
-        .insert(icon_key.clone(), egui::FontData::from_static(MATERIAL_ICONS));
-    fonts.families.insert(
-        egui::FontFamily::Name(crate::icons::ICON_FAMILY.into()),
-        vec![icon_key.clone()],
-    );
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .push(icon_key);
-
-    ctx.set_fonts(fonts);
-}
-
-#[allow(dead_code)]
-pub fn install_cjk_fonts(ctx: &egui::Context) {
-    install_with_lists(ctx, &[], &[]);
+    if !data.is_empty() {
+        cx.text_system().add_fonts(data)?;
+    }
+    Ok(())
 }

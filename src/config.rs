@@ -192,3 +192,42 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn legacy_config_still_loads() {
+        let legacy = r#"
+theme_mode = "Dark"
+window_width = 256.0
+window_height = 256.0
+always_on_top = false
+font_size = 13.0
+hotkey = "Ctrl+Alt+N"
+autosave_delay_ms = 1500
+poll_interval_ms = 500
+"#;
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.theme_mode, ThemeMode::Dark);
+        assert!(cfg.close_to_tray);
+        assert_eq!(cfg.hotkey_capture, "Ctrl+Alt+Shift+C");
+        assert_eq!(cfg.md_dark, MdColors::default_dark());
+    }
+    #[test]
+    fn config_roundtrip_preserves_paths_tabs_and_colors() {
+        let mut cfg = Config {
+            ui_fonts: vec![r"C:\Fonts\中文.ttf".into()],
+            ..Config::default()
+        };
+        cfg.open_tabs.push(OpenTab {
+            folder_key: "_global".into(),
+            note_name: "中文🙂".into(),
+        });
+        cfg.md_dark.heading = [1, 2, 3];
+        let restored: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.ui_fonts, cfg.ui_fonts);
+        assert_eq!(restored.open_tabs, cfg.open_tabs);
+        assert_eq!(restored.md_dark, cfg.md_dark);
+    }
+}

@@ -1,643 +1,709 @@
-use egui::{Align, Color32, FontId, Layout, Margin, Rect, RichText, Sense, Stroke, Vec2};
+use std::{path::Path, rc::Rc};
 
-use crate::chrome::{self, TitleBarConfig, TITLE_BAR_HEIGHT};
-use crate::config::Config;
-use crate::fonts;
-use crate::icons;
-use crate::theme::{palette, ThemeMode};
+use anyhow::anyhow;
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
+    combobox::{Combobox, ComboboxEvent, ComboboxState},
+    form::{Field, Form},
+    input::{Input, InputEvent, InputState, NumberInput, Textarea, TextareaState},
+    notification::{Notification, NotificationType},
+    searchable_list::{SearchableListItem, SearchableVec},
+    switch::Switch,
+    tab::{Tab, TabBar},
+    ActiveTheme as _, IndexPath as ComponentIndexPath, WindowExt as _,
+};
+use gpui_kit::{
+    div, prelude::*, px, size, App, Bounds, Context, Entity, Hsla, IntoElement, Render, Rgba,
+    SharedString, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
+};
 
-pub fn draw_settings_window(ctx: &egui::Context, cfg: &mut Config, current_fg: Option<String>) {
-    let p = palette(cfg.theme_mode);
+use crate::{
+    config::{Config, MdColors},
+    fonts,
+    theme::ThemeMode,
+};
 
-    let frame = egui::Frame {
-        fill: p.bg,
-        stroke: Stroke::new(1.0, p.stroke),
-        rounding: egui::Rounding::ZERO,
-        inner_margin: Margin::ZERO,
-        outer_margin: Margin::ZERO,
+type FontState = ComboboxState<SearchableVec<FontChoice>>;
+type ApplyCallback = dyn Fn(Config, &mut Window, &mut App) -> bool;
+
+const COLOR_LABELS: [&str; 11] = [
+    "正文",
+    "标题",
+    "粗体",
+    "斜体",
+    "行内代码",
+    "代码背景",
+    "链接",
+    "引用文字",
+    "引用边线",
+    "列表标记",
+    "语法标点",
+];
+
+#[derive(Clone)]
+struct FontChoice {
+    path: String,
+    label: SharedString,
+}
+
+impl SearchableListItem for FontChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.path
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.label.to_lowercase().contains(&query) || self.path.to_lowercase().contains(&query)
+    }
+}
+
+pub struct SettingsView {
+    draft: Config,
+    tab: usize,
+    font_size: Entity<InputState>,
+    window_width: Entity<InputState>,
+    window_height: Entity<InputState>,
+    autosave_delay: Entity<InputState>,
+    poll_interval: Entity<InputState>,
+    hotkey: Entity<InputState>,
+    hotkey_capture: Entity<InputState>,
+    blocked_apps: Entity<TextareaState>,
+    ui_fonts: Entity<FontState>,
+    editor_fonts: Entity<FontState>,
+    dark_colors: Vec<Entity<ColorPickerState>>,
+    light_colors: Vec<Entity<ColorPickerState>>,
+    on_apply: Rc<ApplyCallback>,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub fn open(
+    cfg: Config,
+    on_apply: impl Fn(Config, &mut Window, &mut App) -> bool + 'static,
+    cx: &mut App,
+) -> anyhow::Result<Entity<SettingsView>> {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(720.), px(650.)),
+            cx,
+        ))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("NxNote 设置".into()),
+            ..Default::default()
+        }),
         ..Default::default()
     };
+    let callback: Rc<ApplyCallback> = Rc::new(on_apply);
+    let (_, view) = gpui_kit::open_window(options, cx, move |window, cx| {
+        let cfg = cfg.clone();
+        let callback = callback.clone();
+        cx.new(|cx| SettingsView::new(cfg, callback, window, cx))
+    })
+    .map_err(|error| anyhow!("无法打开设置窗口: {error}"))?;
+    Ok(view)
+}
 
-    egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-        let full = ui.max_rect();
+impl SettingsView {
+    fn new(
+        draft: Config,
+        on_apply: Rc<ApplyCallback>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let font_size = number_state(draft.font_size as f64, 10., 24., 0.5, window, cx);
+        let window_width = number_state(draft.window_width as f64, 220., 1600., 1., window, cx);
+        let window_height = number_state(draft.window_height as f64, 200., 1600., 1., window, cx);
+        let autosave_delay = number_state(
+            draft.autosave_delay_ms as f64,
+            200.,
+            10_000.,
+            50.,
+            window,
+            cx,
+        );
+        let poll_interval =
+            number_state(draft.poll_interval_ms as f64, 100., 5_000., 50., window, cx);
+        let hotkey = cx.new(|cx| InputState::new(window, cx).default_value(draft.hotkey.clone()));
+        let hotkey_capture =
+            cx.new(|cx| InputState::new(window, cx).default_value(draft.hotkey_capture.clone()));
+        let blocked_apps = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(7)
+                .default_value(draft.blocked_apps.join("\n"))
+        });
+        let ui_fonts = font_state(&draft.ui_fonts, window, cx);
+        let editor_fonts = font_state(&draft.editor_fonts, window, cx);
+        let dark_colors = color_states(&draft.md_dark, window, cx);
+        let light_colors = color_states(&draft.md_light, window, cx);
 
-        // 自绘标题栏
-        let title_rect = Rect::from_min_max(
-            full.min,
-            egui::pos2(full.right(), full.top() + TITLE_BAR_HEIGHT),
+        let mut subscriptions = Vec::new();
+        for state in [
+            &font_size,
+            &window_width,
+            &window_height,
+            &autosave_delay,
+            &poll_interval,
+            &hotkey,
+            &hotkey_capture,
+        ] {
+            subscriptions.push(cx.subscribe(state, |_: &mut Self, _, _: &InputEvent, cx| {
+                cx.notify();
+            }));
+        }
+        subscriptions.push(
+            cx.subscribe(&blocked_apps, |_: &mut Self, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
         );
-        let tb_out = chrome::draw_title_bar(
-            ctx,
-            ui,
-            title_rect,
-            TitleBarConfig {
-                title: "设置",
-                show_min_max: false,
-                mode: cfg.theme_mode,
-                on_top: None,
-            },
-        );
-        if tb_out.close_clicked {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        subscriptions.push(cx.subscribe(
+            &ui_fonts,
+            |_: &mut Self, _, _: &ComboboxEvent<SearchableVec<FontChoice>>, cx| cx.notify(),
+        ));
+        subscriptions.push(cx.subscribe(
+            &editor_fonts,
+            |_: &mut Self, _, _: &ComboboxEvent<SearchableVec<FontChoice>>, cx| cx.notify(),
+        ));
+        for state in dark_colors.iter().chain(light_colors.iter()) {
+            subscriptions.push(
+                cx.subscribe(state, |_: &mut Self, _, _: &ColorPickerEvent, cx| {
+                    cx.notify()
+                }),
+            );
         }
 
-        // 内容
-        let content_rect = Rect::from_min_max(
-            egui::pos2(full.left() + 16.0, title_rect.bottom() + 8.0),
-            egui::pos2(full.right() - 16.0, full.bottom() - 30.0),
-        );
-        let mut content_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(content_rect)
-                .layout(Layout::top_down(Align::LEFT)),
-        );
-        draw_body(&mut content_ui, cfg, current_fg.as_deref());
-
-        // Footer
-        let footer_rect = Rect::from_min_max(
-            egui::pos2(full.left() + 16.0, full.bottom() - 26.0),
-            egui::pos2(full.right() - 16.0, full.bottom() - 6.0),
-        );
-        let mut footer_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(footer_rect)
-                .layout(Layout::right_to_left(Align::Center)),
-        );
-        footer_ui.label(
-            RichText::new("NxNote · 配置自动保存")
-                .small()
-                .color(p.text_weak),
-        );
-
-        chrome::draw_resize_handles(ctx, ui);
-    });
-}
-
-fn draw_body(ui: &mut egui::Ui, cfg: &mut Config, current_fg: Option<&str>) {
-    let p = palette(cfg.theme_mode);
-
-    let total_w = ui.available_width();
-    let col_gap = 24.0;
-    let col_w = ((total_w - col_gap) / 2.0).max(220.0);
-    let total_h = ui.available_height();
-
-    let origin = ui.cursor().left_top();
-    let left_rect = Rect::from_min_size(origin, Vec2::new(col_w, total_h));
-    let right_rect = Rect::from_min_size(
-        egui::pos2(origin.x + col_w + col_gap, origin.y),
-        Vec2::new(col_w, total_h),
-    );
-    ui.allocate_rect(
-        Rect::from_min_size(origin, Vec2::new(total_w, total_h)),
-        Sense::hover(),
-    );
-
-    // 左列
-    let mut left = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(left_rect)
-            .layout(Layout::top_down(Align::LEFT)),
-    );
-    egui::ScrollArea::vertical()
-        .id_salt("settings_left")
-        .auto_shrink([false; 2])
-        .show(&mut left, |ui| {
-            section(ui, "显示", &p, |ui| {
-                row(ui, "主题模式", "外观主题", |ui| {
-                    segmented(
-                        ui,
-                        &mut cfg.theme_mode,
-                        &[
-                            (ThemeMode::System, "系统"),
-                            (ThemeMode::Light, "浅色"),
-                            (ThemeMode::Dark, "深色"),
-                        ],
-                    );
-                });
-                row(ui, "字号", "正文字号", |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut cfg.font_size)
-                            .range(10.0..=24.0)
-                            .speed(0.1)
-                            .suffix(" px"),
-                    );
-                });
-                ui.add_space(2.0);
-                ui.label(RichText::new("界面字体").color(p.text).size(12.5));
-                font_list_picker(ui, "ui_fonts", &mut cfg.ui_fonts);
-                ui.add_space(4.0);
-                ui.label(RichText::new("编辑字体").color(p.text).size(12.5));
-                font_list_picker(ui, "editor_fonts", &mut cfg.editor_fonts);
-                ui.add_space(6.0);
-                // 颜色配置入口 —— 用 LayoutJob 把图标和文字拼到同一行
-                let mut job = egui::text::LayoutJob::default();
-                job.append(
-                    icons::COLOR_LENS,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: icons::font(14.0),
-                        color: ui.visuals().text_color(),
-                        valign: Align::Center,
-                        ..Default::default()
-                    },
-                );
-                job.append(
-                    "   颜色配置…",
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::proportional(12.5),
-                        color: ui.visuals().text_color(),
-                        valign: Align::Center,
-                        ..Default::default()
-                    },
-                );
-                if ui
-                    .add_sized(Vec2::new(170.0, 26.0), egui::Button::new(job))
-                    .on_hover_text("分别配置深色 / 浅色主题下的 MD 渲染色")
-                    .clicked()
-                {
-                    ui.ctx().memory_mut(|m| {
-                        m.data
-                            .insert_temp(egui::Id::new("nx_open_color_editor"), true)
-                    });
-                }
-            });
-
-            section(ui, "窗口", &p, |ui| {
-                row(ui, "自动隐藏标题栏", "鼠标移开时收起窗口顶部", |ui| {
-                    toggle(ui, &mut cfg.autohide_title_bar);
-                });
-                row(ui, "默认宽度", "启动时的初始宽度", |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut cfg.window_width)
-                            .range(200.0..=1600.0)
-                            .speed(1.0)
-                            .suffix(" px"),
-                    );
-                });
-                row(ui, "默认高度", "启动时的初始高度", |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut cfg.window_height)
-                            .range(160.0..=1600.0)
-                            .speed(1.0)
-                            .suffix(" px"),
-                    );
-                });
-            });
-
-            section(ui, "系统", &p, |ui| {
-                row(ui, "开机自启", "登录 Windows 后自动以隐藏态启动", |ui| {
-                    toggle(ui, &mut cfg.autostart);
-                });
-                row(
-                    ui,
-                    "关闭最小化到托盘",
-                    "点关闭 X 或按 Alt+F4 时隐藏到托盘而不是退出（托盘菜单「退出」始终生效）",
-                    |ui| {
-                        toggle(ui, &mut cfg.close_to_tray);
-                    },
-                );
-            });
-        });
-
-    // 右列
-    let mut right = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(right_rect)
-            .layout(Layout::top_down(Align::LEFT)),
-    );
-    egui::ScrollArea::vertical()
-        .id_salt("settings_right")
-        .auto_shrink([false; 2])
-        .show(&mut right, |ui| {
-            section(ui, "热键", &p, |ui| {
-                row(ui, "显示 / 隐藏", "全局呼出 NxNote 的组合键", |ui| {
-                    hotkey_recorder(ui, &mut cfg.hotkey);
-                });
-                ui.add_space(2.0);
-                row(
-                    ui,
-                    "速记捕获",
-                    "任意应用里按下后，把剪贴板文本追加进速记本（不抢焦点）",
-                    |ui| {
-                        hotkey_recorder(ui, &mut cfg.hotkey_capture);
-                    },
-                );
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("按 Esc 取消录制；需要至少一个修饰键 (Ctrl/Alt/Shift/Win)。")
-                        .small()
-                        .color(p.text_weak),
-                );
-            });
-
-            section(ui, "自动行为", &p, |ui| {
-                row(
-                    ui,
-                    "随前台切换笔记",
-                    "打开后 NxNote 自动跟随当前前台应用；关闭则由你自己在菜单里选择",
-                    |ui| {
-                        toggle(ui, &mut cfg.auto_follow_foreground);
-                    },
-                );
-                row(ui, "保存延迟", "停止输入后写盘等待 (ms)", |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut cfg.autosave_delay_ms)
-                            .range(200..=10000)
-                            .speed(10),
-                    );
-                });
-                row(ui, "前台轮询", "检测前台应用间隔 (ms)，实时生效", |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut cfg.poll_interval_ms)
-                            .range(100..=5000)
-                            .speed(10),
-                    );
-                });
-            });
-
-            section(ui, "应用黑名单", &p, |ui| {
-                ui.label(
-                    RichText::new("命中后视为未绑定，写入速记本。匹配 exe 全路径或文件名。")
-                        .small()
-                        .color(p.text_weak),
-                );
-                ui.add_space(4.0);
-                blocked_apps_picker(ui, &mut cfg.blocked_apps, current_fg, &p);
-            });
-        });
-}
-
-fn blocked_apps_picker(
-    ui: &mut egui::Ui,
-    value: &mut Vec<String>,
-    current_fg: Option<&str>,
-    p: &crate::theme::Palette,
-) {
-    // 当前前台 debug + 一键加黑
-    if let Some(fg) = current_fg {
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new("当前前台 exe（NxNote 实际看到的路径）：")
-                .small()
-                .color(p.text_weak),
-        );
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(fg).small().color(p.text));
-        });
-        if ui
-            .button("把当前前台加入黑名单")
-            .on_hover_text("用 NxNote 实际看到的路径，避免手输出入")
-            .clicked()
-        {
-            let s = fg.to_string();
-            if !value.contains(&s) {
-                value.push(s);
-            }
+        Self {
+            draft,
+            tab: 0,
+            font_size,
+            window_width,
+            window_height,
+            autosave_delay,
+            poll_interval,
+            hotkey,
+            hotkey_capture,
+            blocked_apps,
+            ui_fonts,
+            editor_fonts,
+            dark_colors,
+            light_colors,
+            on_apply,
+            _subscriptions: subscriptions,
         }
-        ui.add_space(6.0);
     }
 
-    let mut to_remove: Option<usize> = None;
-    for (i, item) in value.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let display = if item.len() > 36 {
-                let s: String = item.chars().take(34).collect();
-                format!("{}…", s)
-            } else {
-                item.clone()
-            };
-            ui.label(RichText::new(display).size(12.0))
-                .on_hover_text(item);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.scope(|ui| {
-                    ui.spacing_mut().button_padding = Vec2::new(4.0, 1.0);
-                    if ui.button(RichText::new("×").size(11.0)).clicked() {
-                        to_remove = Some(i);
-                    }
-                });
-            });
-        });
-    }
-    if let Some(i) = to_remove {
-        value.remove(i);
-    }
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let id = ui.id().with("blocked_input");
-        let mut buf: String = ui
-            .ctx()
-            .memory_mut(|m| m.data.get_temp::<String>(id).unwrap_or_default());
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut buf)
-                .desired_width(180.0)
-                .hint_text("exe 文件名或完整路径"),
-        );
-        if resp.changed() {
-            ui.ctx().memory_mut(|m| m.data.insert_temp(id, buf.clone()));
-        }
-        if ui.button("添加").clicked() {
-            let trimmed = buf.trim().to_string();
-            if !trimmed.is_empty() && !value.contains(&trimmed) {
-                value.push(trimmed);
-            }
-            ui.ctx().memory_mut(|m| m.data.insert_temp(id, String::new()));
-        }
-    });
-}
-
-fn section<R>(
-    ui: &mut egui::Ui,
-    title: &str,
-    p: &crate::theme::Palette,
-    add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    ui.add_space(6.0);
-    ui.label(RichText::new(title).color(p.text_strong).size(13.0));
-    ui.add_space(2.0);
-    let r = add_contents(ui);
-    ui.add_space(8.0);
-    r
-}
-
-fn row<R>(
-    ui: &mut egui::Ui,
-    label: &str,
-    hint: &str,
-    add_control: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    let mut result: Option<R> = None;
-    ui.horizontal(|ui| {
-        ui.set_min_height(26.0);
-        ui.label(label).on_hover_text(hint);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            result = Some(add_control(ui));
-        });
-    });
-    result.unwrap()
-}
-
-fn segmented<T: PartialEq + Clone>(
-    ui: &mut egui::Ui,
-    value: &mut T,
-    options: &[(T, &str)],
-) {
-    ui.scope(|ui| {
-        ui.style_mut().spacing.item_spacing = Vec2::new(2.0, 0.0);
-        ui.style_mut().spacing.button_padding = Vec2::new(10.0, 4.0);
-        for (v, label) in options {
-            let selected = value == v;
-            let resp = ui.add(egui::SelectableLabel::new(selected, *label));
-            if resp.clicked() {
-                *value = v.clone();
-            }
-        }
-    });
-}
-
-fn toggle(ui: &mut egui::Ui, value: &mut bool) {
-    let desired = Vec2::new(36.0, 18.0);
-    let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
-    if resp.clicked() {
-        *value = !*value;
-    }
-    let p = ui.painter();
-    let bg = if *value {
-        ui.visuals().selection.bg_fill
-    } else {
-        ui.visuals().widgets.inactive.bg_fill
-    };
-    p.rect_filled(rect, egui::Rounding::same(9.0), bg);
-    let knob_r = 6.5;
-    let pad = 2.0;
-    let knob_cx = if *value {
-        rect.right() - knob_r - pad
-    } else {
-        rect.left() + knob_r + pad
-    };
-    let knob_color = if *value { Color32::WHITE } else { ui.visuals().text_color() };
-    p.circle_filled(egui::pos2(knob_cx, rect.center().y), knob_r, knob_color);
-}
-
-fn hotkey_recorder(ui: &mut egui::Ui, value: &mut String) {
-    let id = ui.id().with("hotkey_recorder");
-    let mut recording: bool = ui
-        .ctx()
-        .memory(|m| m.data.get_temp(id).unwrap_or(false));
-    // 无修饰键的裸键提示（注册成全局热键会吞掉系统所有按键输入，禁止）
-    let warn_id = id.with("warn_nomod");
-    let mut warn_nomod: bool = ui
-        .ctx()
-        .memory(|m| m.data.get_temp(warn_id).unwrap_or(false));
-
-    let label_txt = if recording {
-        "按下任意组合键…".to_string()
-    } else if value.is_empty() {
-        "<未绑定>".to_string()
-    } else {
-        value.clone()
-    };
-
-    // 用 LayoutJob 组合图标 + 标签
-    let color = if recording {
-        ui.visuals().selection.bg_fill
-    } else {
-        ui.visuals().text_color()
-    };
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        icons::KEYBOARD,
-        0.0,
-        egui::TextFormat {
-            font_id: icons::font(14.0),
-            color,
-            valign: Align::Center,
-            ..Default::default()
-        },
-    );
-    job.append(
-        &format!("   {}", label_txt),
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::proportional(12.5),
-            color,
-            valign: Align::Center,
-            ..Default::default()
-        },
-    );
-
-    let btn_size = Vec2::new(170.0, 26.0);
-    let resp = ui.add_sized(btn_size, egui::Button::new(job));
-    if resp.clicked() {
-        recording = !recording;
-        warn_nomod = false;
-    }
-
-    if recording {
-        if let Some(captured) = capture_hotkey(ui.ctx()) {
-            match captured.as_str() {
-                "__cancel__" => {
-                    recording = false;
-                    warn_nomod = false;
-                }
-                "__nomod__" => {
-                    // 不退出录制态，提示后继续等
-                    warn_nomod = true;
-                }
-                _ => {
-                    *value = captured;
-                    recording = false;
-                    warn_nomod = false;
+    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.collected_config(cx) {
+            Ok(config) => {
+                if (self.on_apply)(config.clone(), window, cx) {
+                    self.draft = config;
+                    window.push_notification(
+                        Notification::new()
+                            .with_type(NotificationType::Success)
+                            .message("设置已应用"),
+                        cx,
+                    );
+                } else {
+                    window.push_notification(
+                        Notification::new()
+                            .with_type(NotificationType::Error)
+                            .message("设置未能保存；修改仍保留在此窗口中"),
+                        cx,
+                    );
                 }
             }
+            Err(error) => window.push_notification(
+                Notification::new()
+                    .with_type(NotificationType::Error)
+                    .message(error.to_string()),
+                cx,
+            ),
         }
-    } else {
-        warn_nomod = false;
     }
 
-    if warn_nomod {
-        ui.label(
-            RichText::new("需要至少一个修饰键 (Ctrl/Alt/Shift/Win)")
-                .small()
-                .color(ui.visuals().error_fg_color),
-        );
-    }
+    fn collected_config(&self, cx: &App) -> anyhow::Result<Config> {
+        let font_size = read_number(&self.font_size, "字号", 10., 24., cx)? as f32;
+        let window_width = read_number(&self.window_width, "默认宽度", 220., 1600., cx)? as f32;
+        let window_height = read_number(&self.window_height, "默认高度", 200., 1600., cx)? as f32;
+        let autosave_delay_ms =
+            read_number(&self.autosave_delay, "保存延迟", 200., 10_000., cx)? as u64;
+        let poll_interval_ms =
+            read_number(&self.poll_interval, "前台轮询", 100., 5_000., cx)? as u64;
 
-    ui.ctx().memory_mut(|m| m.data.insert_temp(id, recording));
-    ui.ctx().memory_mut(|m| m.data.insert_temp(warn_id, warn_nomod));
-}
+        let hotkey = self.hotkey.read(cx).value().trim().to_string();
+        let hotkey_capture = self.hotkey_capture.read(cx).value().trim().to_string();
+        if crate::hotkey::parse(&hotkey).is_none() {
+            return Err(anyhow!("显示 / 隐藏热键格式无效"));
+        }
+        if crate::hotkey::parse(&hotkey_capture).is_none() {
+            return Err(anyhow!("速记捕获热键格式无效"));
+        }
+        if hotkey.eq_ignore_ascii_case(&hotkey_capture) {
+            return Err(anyhow!("两个全局热键不能重复"));
+        }
 
-fn capture_hotkey(ctx: &egui::Context) -> Option<String> {
-    ctx.input(|i| {
-        for ev in &i.events {
-            if let egui::Event::Key {
-                key,
-                modifiers,
-                pressed: true,
-                repeat: false,
-                ..
-            } = ev
+        let mut blocked_apps = Vec::new();
+        for line in self.blocked_apps.read(cx).value().lines() {
+            let value = line.trim();
+            if !value.is_empty()
+                && !blocked_apps
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(value))
             {
-                if *key == egui::Key::Escape {
-                    return Some("__cancel__".to_string());
-                }
-                if let Some(name) = key_name(*key) {
-                    // 裸键不允许：无修饰键的全局热键会吞掉整个系统的这个按键
-                    // command = ctrl 或 mac_cmd（平台相关），覆盖即可
-                    let m = *modifiers;
-                    let has_mod = m.ctrl || m.alt || m.shift || m.command || m.mac_cmd;
-                    if !has_mod {
-                        return Some("__nomod__".to_string());
-                    }
-                    return Some(format_hotkey(*modifiers, name));
-                }
+                blocked_apps.push(value.to_string());
             }
         }
-        None
+
+        let mut config = self.draft.clone();
+        config.font_size = font_size;
+        config.window_width = window_width;
+        config.window_height = window_height;
+        config.autosave_delay_ms = autosave_delay_ms;
+        config.poll_interval_ms = poll_interval_ms;
+        config.hotkey = hotkey;
+        config.hotkey_capture = hotkey_capture;
+        config.blocked_apps = blocked_apps;
+        config.ui_fonts = self.ui_fonts.read(cx).selected_values();
+        config.editor_fonts = self.editor_fonts.read(cx).selected_values();
+        config.md_dark = colors_from_states(&self.dark_colors, "深色", cx)?;
+        config.md_light = colors_from_states(&self.light_colors, "浅色", cx)?;
+        Ok(config)
+    }
+
+    fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Form::horizontal()
+            .label_width(px(150.))
+            .child(
+                Field::new()
+                    .label("主题")
+                    .description("跟随系统或固定外观")
+                    .child(
+                        TabBar::new("theme-mode")
+                            .segmented()
+                            .selected_index(match self.draft.theme_mode {
+                                ThemeMode::System => 0,
+                                ThemeMode::Light => 1,
+                                ThemeMode::Dark => 2,
+                            })
+                            .children([
+                                Tab::new().label("系统"),
+                                Tab::new().label("浅色"),
+                                Tab::new().label("深色"),
+                            ])
+                            .on_click(cx.listener(|this, index, _, cx| {
+                                this.draft.theme_mode = match *index {
+                                    1 => ThemeMode::Light,
+                                    2 => ThemeMode::Dark,
+                                    _ => ThemeMode::System,
+                                };
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                Field::new()
+                    .label("字号")
+                    .description("正文显示字号，10–24 px")
+                    .child(NumberInput::new(&self.font_size).suffix("px")),
+            )
+            .child(
+                Field::new()
+                    .label("界面字体")
+                    .description("可搜索、多选；选择顺序即回退顺序")
+                    .child(
+                        Combobox::new(&self.ui_fonts)
+                            .placeholder("选择界面字体")
+                            .search_placeholder("搜索字体或路径")
+                            .menu_max_h(px(320.))
+                            .w_full(),
+                    ),
+            )
+            .child(
+                Field::new()
+                    .label("编辑字体")
+                    .description("可搜索、多选；选择顺序即回退顺序")
+                    .child(
+                        Combobox::new(&self.editor_fonts)
+                            .placeholder("选择编辑字体")
+                            .search_placeholder("搜索字体或路径")
+                            .menu_max_h(px(320.))
+                            .w_full(),
+                    ),
+            )
+            .child(Field::new().label("自动隐藏标题栏").child(settings_switch(
+                "autohide-titlebar",
+                self.draft.autohide_title_bar,
+                cx.listener(|this, checked, _, cx| {
+                    this.draft.autohide_title_bar = *checked;
+                    cx.notify();
+                }),
+            )))
+            .child(
+                Field::new()
+                    .label("默认宽度")
+                    .child(NumberInput::new(&self.window_width).suffix("px")),
+            )
+            .child(
+                Field::new()
+                    .label("默认高度")
+                    .child(NumberInput::new(&self.window_height).suffix("px")),
+            )
+            .child(Field::new().label("窗口始终置顶").child(settings_switch(
+                "always-on-top",
+                self.draft.always_on_top,
+                cx.listener(|this, checked, _, cx| {
+                    this.draft.always_on_top = *checked;
+                    cx.notify();
+                }),
+            )))
+    }
+
+    fn render_behavior(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Form::horizontal()
+            .label_width(px(170.))
+            .child(
+                Field::new()
+                    .label("开机自启")
+                    .description("登录 Windows 后以隐藏态启动")
+                    .child(settings_switch(
+                        "autostart",
+                        self.draft.autostart,
+                        cx.listener(|this, checked, _, cx| {
+                            this.draft.autostart = *checked;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                Field::new()
+                    .label("关闭最小化到托盘")
+                    .child(settings_switch(
+                        "close-to-tray",
+                        self.draft.close_to_tray,
+                        cx.listener(|this, checked, _, cx| {
+                            this.draft.close_to_tray = *checked;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                Field::new()
+                    .label("随前台切换笔记")
+                    .description("自动跟随当前前台应用")
+                    .child(settings_switch(
+                        "auto-follow",
+                        self.draft.auto_follow_foreground,
+                        cx.listener(|this, checked, _, cx| {
+                            this.draft.auto_follow_foreground = *checked;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                Field::new()
+                    .label("保存延迟")
+                    .description("停止输入后写盘等待，200–10000 ms")
+                    .child(NumberInput::new(&self.autosave_delay).suffix("ms")),
+            )
+            .child(
+                Field::new()
+                    .label("前台轮询")
+                    .description("检测前台应用间隔，100–5000 ms")
+                    .child(NumberInput::new(&self.poll_interval).suffix("ms")),
+            )
+            .child(
+                Field::new()
+                    .label("应用黑名单")
+                    .description("每行一个 exe 文件名或完整路径；空行会忽略")
+                    .items_start()
+                    .child(Textarea::new(&self.blocked_apps).w_full()),
+            )
+    }
+
+    fn render_hotkeys(&self) -> impl IntoElement {
+        Form::horizontal()
+            .label_width(px(170.))
+            .child(
+                Field::new()
+                    .label("显示 / 隐藏")
+                    .description("例如 Ctrl+Alt+N")
+                    .child(Input::new(&self.hotkey).w_full()),
+            )
+            .child(
+                Field::new()
+                    .label("速记捕获")
+                    .description("例如 Ctrl+Alt+Shift+C")
+                    .child(Input::new(&self.hotkey_capture).w_full()),
+            )
+            .child(Field::new().label_indent(false).child(
+                div().text_sm().child(
+                    "应用时校验热键格式；两个全局热键不能重复。实际系统重注册由主程序完成。",
+                ),
+            ))
+    }
+
+    fn render_colors(&self) -> impl IntoElement {
+        let dark = color_form("深色主题 Markdown 颜色", &self.dark_colors);
+        let light = color_form("浅色主题 Markdown 颜色", &self.light_colors);
+        div()
+            .flex()
+            .gap_6()
+            .items_start()
+            .child(div().flex_1().min_w_0().child(dark))
+            .child(div().flex_1().min_w_0().child(light))
+    }
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match self.tab {
+            0 => self.render_general(cx).into_any_element(),
+            1 => self.render_behavior(cx).into_any_element(),
+            2 => self.render_hotkeys().into_any_element(),
+            _ => self.render_colors().into_any_element(),
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div().px_6().pt_5().pb_3().child(
+                    TabBar::new("settings-sections")
+                        .selected_index(self.tab)
+                        .children([
+                            Tab::new().label("外观与窗口"),
+                            Tab::new().label("自动行为"),
+                            Tab::new().label("热键"),
+                            Tab::new().label("Markdown 颜色"),
+                        ])
+                        .on_click(cx.listener(|this, index, _, cx| {
+                            this.tab = *index;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_6()
+                    .pb_5()
+                    .child(content),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .px_6()
+                    .py_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("修改仅在点击“应用”后交给主程序保存。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-settings")
+                                    .label("取消")
+                                    .on_click(|_, window, _| window.remove_window()),
+                            )
+                            .child(
+                                Button::new("apply-settings")
+                                    .primary()
+                                    .label("应用")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.apply(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
+fn number_state(
+    value: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(value.to_string())
+            .step(step)
+            .min(min)
+            .max(max)
     })
 }
 
-fn format_hotkey(mods: egui::Modifiers, key_name: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    if mods.ctrl {
-        parts.push("Ctrl");
+fn read_number(
+    state: &Entity<InputState>,
+    label: &str,
+    min: f64,
+    max: f64,
+    cx: &App,
+) -> anyhow::Result<f64> {
+    let text = state.read(cx).value();
+    let value = text
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| anyhow!("{label}不是有效数字"))?;
+    if !value.is_finite() || value < min || value > max {
+        return Err(anyhow!("{label}必须在 {min}–{max} 之间"));
     }
-    if mods.alt {
-        parts.push("Alt");
-    }
-    if mods.shift {
-        parts.push("Shift");
-    }
-    if mods.mac_cmd || (mods.command && !mods.ctrl) {
-        parts.push("Win");
-    }
-    parts.push(key_name);
-    parts.join("+")
+    Ok(value)
 }
 
-fn font_list_picker(ui: &mut egui::Ui, id: &str, value: &mut Vec<String>) {
-    ui.add_space(2.0);
-    let mut to_remove: Option<usize> = None;
-    let mut to_move: Option<(usize, isize)> = None;
+fn settings_switch(
+    id: &'static str,
+    checked: bool,
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> Switch {
+    Switch::new(id).checked(checked).on_change(on_change)
+}
 
-    let len = value.len();
-    for (i, path) in value.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let name = fonts::font_display_name(std::path::Path::new(path));
-            ui.scope(|ui| {
-                ui.spacing_mut().button_padding = Vec2::new(4.0, 1.0);
-                let up = ui.add_enabled(i > 0, egui::Button::new(
-                    egui::RichText::new("▲").size(10.0),
-                ));
-                if up.clicked() {
-                    to_move = Some((i, -1));
-                }
-                let dn = ui.add_enabled(i + 1 < len, egui::Button::new(
-                    egui::RichText::new("▼").size(10.0),
-                ));
-                if dn.clicked() {
-                    to_move = Some((i, 1));
-                }
-            });
-            ui.label(RichText::new(format!("{}. ", i + 1)).color(ui.visuals().weak_text_color()).small());
-            ui.label(RichText::new(name).size(12.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.scope(|ui| {
-                    ui.spacing_mut().button_padding = Vec2::new(4.0, 1.0);
-                    if ui.button(RichText::new("×").size(11.0)).clicked() {
-                        to_remove = Some(i);
-                    }
-                });
-            });
-        });
-    }
-
-    if let Some(i) = to_remove {
-        value.remove(i);
-    }
-    if let Some((i, dir)) = to_move {
-        let j = ((i as isize) + dir) as usize;
-        if j < value.len() {
-            value.swap(i, j);
+fn font_state(
+    selected: &[String],
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
+) -> Entity<FontState> {
+    let mut paths = Vec::<String>::new();
+    for path in selected {
+        if !paths.contains(path) {
+            paths.push(path.clone());
         }
     }
-
-    ui.add_space(2.0);
-    egui::ComboBox::from_id_salt(format!("{}_add", id))
-        .selected_text(RichText::new("＋ 添加字体").size(12.0))
-        .width(160.0)
-        .show_ui(ui, |ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                for path in fonts::list_system_fonts() {
-                    let path_str = path.to_string_lossy().to_string();
-                    if value.contains(&path_str) {
-                        continue;
-                    }
-                    let name = fonts::font_display_name(path);
-                    if ui.selectable_label(false, name).clicked() {
-                        value.push(path_str);
-                    }
-                }
-            });
-        });
+    let selected_count = paths.len();
+    for path in fonts::list_system_fonts() {
+        let path = path.to_string_lossy().to_string();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    let choices = paths
+        .into_iter()
+        .map(|path| FontChoice {
+            label: fonts::font_display_name(Path::new(&path)).into(),
+            path,
+        })
+        .collect::<Vec<_>>();
+    let selected_indices = (0..selected_count)
+        .map(|row| ComponentIndexPath::default().row(row))
+        .collect();
+    cx.new(|cx| {
+        ComboboxState::new(SearchableVec::new(choices), selected_indices, window, cx)
+            .multiple(true)
+            .searchable(true)
+    })
 }
 
-fn key_name(k: egui::Key) -> Option<&'static str> {
-    use egui::Key::*;
-    Some(match k {
-        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F",
-        G => "G", H => "H", I => "I", J => "J", K => "K", L => "L",
-        M => "M", N => "N", O => "O", P => "P", Q => "Q", R => "R",
-        S => "S", T => "T", U => "U", V => "V", W => "W", X => "X",
-        Y => "Y", Z => "Z",
-        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
-        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
-        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4", F5 => "F5", F6 => "F6",
-        F7 => "F7", F8 => "F8", F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
-        Space => "Space",
-        ArrowUp => "Up", ArrowDown => "Down", ArrowLeft => "Left", ArrowRight => "Right",
-        Home => "Home", End => "End", PageUp => "PageUp", PageDown => "PageDown",
-        _ => return None,
+fn color_states(
+    colors: &MdColors,
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
+) -> Vec<Entity<ColorPickerState>> {
+    md_color_values(colors)
+        .into_iter()
+        .map(|rgb| cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb_to_hsla(rgb))))
+        .collect()
+}
+
+fn color_form(title: &'static str, states: &[Entity<ColorPickerState>]) -> impl IntoElement {
+    let mut form = Form::horizontal().label_width(px(86.));
+    for (label, state) in COLOR_LABELS.iter().zip(states.iter()) {
+        form = form.child(
+            Field::new()
+                .label(*label)
+                .child(ColorPicker::new(state).accessibility_label(format!("{title}：{label}"))),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            div()
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(form)
+}
+
+fn md_color_values(colors: &MdColors) -> [[u8; 3]; 11] {
+    [
+        colors.text,
+        colors.heading,
+        colors.bold,
+        colors.italic,
+        colors.code_text,
+        colors.code_bg,
+        colors.link,
+        colors.quote_text,
+        colors.quote_bar,
+        colors.list_marker,
+        colors.syntax,
+    ]
+}
+
+fn colors_from_states(
+    states: &[Entity<ColorPickerState>],
+    theme: &str,
+    cx: &App,
+) -> anyhow::Result<MdColors> {
+    let mut values = [[0_u8; 3]; 11];
+    for (index, state) in states.iter().enumerate() {
+        let color = state
+            .read(cx)
+            .value()
+            .ok_or_else(|| anyhow!("{theme}主题的“{}”颜色未设置", COLOR_LABELS[index]))?;
+        values[index] = hsla_to_rgb(color);
+    }
+    Ok(MdColors {
+        text: values[0],
+        heading: values[1],
+        bold: values[2],
+        italic: values[3],
+        code_text: values[4],
+        code_bg: values[5],
+        link: values[6],
+        quote_text: values[7],
+        quote_bar: values[8],
+        list_marker: values[9],
+        syntax: values[10],
     })
+}
+
+fn rgb_to_hsla(rgb: [u8; 3]) -> Hsla {
+    Rgba {
+        r: rgb[0] as f32 / 255.,
+        g: rgb[1] as f32 / 255.,
+        b: rgb[2] as f32 / 255.,
+        a: 1.,
+    }
+    .into()
+}
+
+fn hsla_to_rgb(color: Hsla) -> [u8; 3] {
+    let rgba = Rgba::from(color);
+    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+    [channel(rgba.r), channel(rgba.g), channel(rgba.b)]
 }

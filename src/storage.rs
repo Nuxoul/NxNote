@@ -25,7 +25,10 @@ impl TitleRule {
         match self {
             TitleRule::SplitIndex { sep, index } => {
                 let parts: Vec<&str> = title.split(sep.as_str()).collect();
-                parts.get(*index).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                parts
+                    .get(*index)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
             }
         }
     }
@@ -97,10 +100,18 @@ pub fn folder_key_for(exe: &Path) -> String {
         .unwrap_or("unknown");
     let safe: String = stem
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path_str = exe.to_string_lossy();
-    let hash = sha1_smol::Sha1::from(path_str.as_bytes()).digest().to_string();
+    let hash = sha1_smol::Sha1::from(path_str.as_bytes())
+        .digest()
+        .to_string();
     format!("{}_{}", safe, &hash[..6])
 }
 
@@ -124,9 +135,17 @@ pub fn note_path(folder_key: &str, note_name: &str) -> PathBuf {
     dir.join(format!("{}.md", note_name))
 }
 
-pub fn load_note(folder_key: &str, note_name: &str) -> String {
+pub fn load_note(folder_key: &str, note_name: &str) -> Result<String> {
     let p = note_path(folder_key, note_name);
-    std::fs::read_to_string(p).unwrap_or_default()
+    read_note(&p)
+}
+
+fn read_note(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(anyhow::anyhow!("无法读取笔记 {}: {error}", path.display())),
+    }
 }
 
 pub fn save_note(folder_key: &str, note_name: &str, content: &str) -> Result<()> {
@@ -156,7 +175,7 @@ pub fn trash_note(folder_key: &str, note_name: &str) -> Result<PathBuf> {
 /// 剪贴板快速捕获：把文本追加到速记本文件（当前视图不在速记本时由后台直写）。
 pub fn append_scratch(text: &str) -> Result<()> {
     let p = note_path(GLOBAL_FOLDER, SCRATCH_NOTE);
-    let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
+    let mut cur = read_note(&p)?;
     if !cur.is_empty() && !cur.ends_with('\n') {
         cur.push('\n');
     }
@@ -171,7 +190,13 @@ pub fn append_scratch(text: &str) -> Result<()> {
 /// 启动恢复：校验 folder/note 真实存在（磁盘上有文件），不存在则回退。
 /// 返回 (folder_key, display_name, note_name)。
 pub fn resolve_startup(index: &AppIndex) -> (String, String, String) {
-    let scratch = || (GLOBAL_FOLDER.to_string(), "速记".to_string(), SCRATCH_NOTE.to_string());
+    let scratch = || {
+        (
+            GLOBAL_FOLDER.to_string(),
+            "速记".to_string(),
+            SCRATCH_NOTE.to_string(),
+        )
+    };
     let (Some(f), Some(n), Some(d)) = (
         index.last_folder_key.clone(),
         index.last_note_name.clone(),
@@ -198,3 +223,39 @@ pub fn resolve_startup(index: &AppIndex) -> (String, String, String) {
 pub const GLOBAL_FOLDER: &str = "_global";
 pub const DEFAULT_NOTE: &str = "_default";
 pub const SCRATCH_NOTE: &str = "scratch";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn title_rules_preserve_unicode_and_ignore_empty_segments() {
+        let rule = TitleRule::SplitIndex {
+            sep: " - ".into(),
+            index: 1,
+        };
+        assert_eq!(
+            rule.extract("应用 -  中文🙂  - 文档"),
+            Some("中文🙂".into())
+        );
+        assert_eq!(rule.extract("应用 -  - 文档"), None);
+        assert_eq!(rule.extract("应用"), None);
+    }
+    #[test]
+    fn index_roundtrip_preserves_application_keys() {
+        let mut index = AppIndex::default();
+        let key = folder_key_for(Path::new(r"C:\Apps\editor.exe"));
+        index.apps.insert(
+            key.clone(),
+            AppEntry {
+                exe_path: r"C:\Apps\editor.exe".into(),
+                display_name: "编辑器".into(),
+                title_rule: None,
+                notes: vec!["笔记".into()],
+            },
+        );
+        let restored: AppIndex =
+            serde_json::from_str(&serde_json::to_string(&index).unwrap()).unwrap();
+        assert_eq!(restored.apps[&key].notes, vec!["笔记"]);
+        assert_eq!(folder_key_for(Path::new(r"C:\Apps\editor.exe")), key);
+    }
+}

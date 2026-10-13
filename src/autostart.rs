@@ -19,29 +19,52 @@ pub fn set_enabled(enable: bool) -> std::io::Result<()> {
         let data = format!("\"{}\" --hidden", exe_str);
         let status = Command::new("reg")
             .args([
-                "add",
-                RUN_KEY,
-                "/v",
-                VALUE_NAME,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &data,
-                "/f",
+                "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &data, "/f",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::other(
-                format!("reg add 退出码 {:?}", status.code()),
-            ));
+            return Err(std::io::Error::other(format!(
+                "reg add 退出码 {:?}",
+                status.code()
+            )));
         }
     } else {
-        // 已不存在时 reg delete 会返回非 0，但目标状态已达成 —— 不视作错误
-        let _ = Command::new("reg")
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+        use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_ANY};
+        let key: Vec<u16> = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let name: Vec<u16> = VALUE_NAME.encode_utf16().chain(Some(0)).collect();
+        let exists = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_ANY,
+                None,
+                None,
+                None,
+            )
+        };
+        if exists == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if exists != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(exists.0 as i32));
+        }
+        let status = Command::new("reg")
             .args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"])
             .creation_flags(CREATE_NO_WINDOW)
-            .status();
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "reg delete 退出码 {:?}",
+                status.code()
+            )));
+        }
     }
     Ok(())
 }
