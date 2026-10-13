@@ -34,7 +34,6 @@ actions!(
         RenameNote,
         DeleteNote,
         Settings,
-        TogglePreview,
         NextTab,
         PreviousTab,
         CloseTab,
@@ -62,11 +61,11 @@ actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
+    use gpui_kit::base::{input as edit, actions as selection};
     cx.bind_keys([
         KeyBinding::new("ctrl-s", Save, Some("NxNote")),
         KeyBinding::new("ctrl-p", QuickSwitch, Some("NxNote")),
         KeyBinding::new("ctrl-n", NewNote, Some("NxNote")),
-        KeyBinding::new("ctrl-shift-p", TogglePreview, Some("NxNote")),
         KeyBinding::new("ctrl-pagedown", NextTab, Some("NxNote")),
         KeyBinding::new("ctrl-pageup", PreviousTab, Some("NxNote")),
         KeyBinding::new("ctrl-tab", NextTab, Some("NxNote")),
@@ -85,11 +84,51 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-7", Tab7, Some("NxNote")),
         KeyBinding::new("ctrl-8", Tab8, Some("NxNote")),
         KeyBinding::new("ctrl-9", Tab9, Some("NxNote")),
-        KeyBinding::new("alt-up", MoveLineUp, Some("NxNote && Input")),
-        KeyBinding::new("alt-down", MoveLineDown, Some("NxNote && Input")),
-        KeyBinding::new("alt-shift-up", CopyLineUp, Some("NxNote && Input")),
-        KeyBinding::new("alt-shift-down", CopyLineDown, Some("NxNote && Input")),
-        KeyBinding::new("ctrl-shift-k", DeleteLines, Some("NxNote && Input")),
+        KeyBinding::new("alt-up", MoveLineUp, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("alt-down", MoveLineDown, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("alt-shift-up", CopyLineUp, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("alt-shift-down", CopyLineDown, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-k", DeleteLines, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-a", gpui_kit::base::input::SelectAll, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-c", gpui_kit::base::input::Copy, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-x", gpui_kit::base::input::Cut, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-v", gpui_kit::base::input::Paste, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-z", gpui_kit::base::input::Undo, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-y", gpui_kit::base::input::Redo, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-z", gpui_kit::base::input::Redo, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("ctrl-f", gpui_kit::base::input::Search, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("left", edit::MoveLeft, Some("MarkdownDocument")),
+        KeyBinding::new("right", edit::MoveRight, Some("MarkdownDocument")),
+        KeyBinding::new("up", edit::MoveUp, Some("MarkdownDocument")),
+        KeyBinding::new("down", edit::MoveDown, Some("MarkdownDocument")),
+        KeyBinding::new("shift-left", selection::SelectLeft, Some("MarkdownDocument")),
+        KeyBinding::new("shift-right", selection::SelectRight, Some("MarkdownDocument")),
+        KeyBinding::new("shift-up", selection::SelectUp, Some("MarkdownDocument")),
+        KeyBinding::new("shift-down", selection::SelectDown, Some("MarkdownDocument")),
+        KeyBinding::new("home", edit::MoveHome, Some("MarkdownDocument")),
+        KeyBinding::new("end", edit::MoveEnd, Some("MarkdownDocument")),
+        KeyBinding::new("shift-home", edit::SelectToStartOfLine, Some("MarkdownDocument")),
+        KeyBinding::new("shift-end", edit::SelectToEndOfLine, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-home", edit::MoveToStart, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-end", edit::MoveToEnd, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-home", edit::SelectToStart, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-end", edit::SelectToEnd, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-left", edit::MoveToPreviousWord, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-right", edit::MoveToNextWord, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-left", edit::SelectToPreviousWordStart, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-right", edit::SelectToNextWordEnd, Some("MarkdownDocument")),
+        KeyBinding::new("backspace", edit::Backspace, Some("MarkdownDocument")),
+        KeyBinding::new("delete", edit::Delete, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-backspace", edit::DeleteToPreviousWordStart, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-delete", edit::DeleteToNextWordEnd, Some("MarkdownDocument")),
+        KeyBinding::new("tab", edit::Indent, Some("MarkdownDocument")),
+        KeyBinding::new("shift-tab", edit::Outdent, Some("MarkdownDocument")),
+        KeyBinding::new("enter", edit::Enter { secondary: false, shift: false }, Some("MarkdownDocument")),
+        KeyBinding::new("shift-enter", edit::Enter { secondary: false, shift: true }, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-enter", edit::Enter { secondary: true, shift: false }, Some("MarkdownDocument")),
+        KeyBinding::new("escape", edit::Escape, Some("MarkdownDocument")),
+        KeyBinding::new("pageup", edit::MovePageUp, Some("MarkdownDocument")),
+        KeyBinding::new("pagedown", edit::MovePageDown, Some("MarkdownDocument")),
     ]);
 }
 
@@ -105,7 +144,6 @@ pub struct NxNoteApp {
     poll_ms: Arc<AtomicU64>,
     hwnd: isize,
     hidden: bool,
-    preview: bool,
     title_hover: bool,
     status: String,
     focus: FocusHandle,
@@ -205,7 +243,6 @@ impl NxNoteApp {
             poll_ms,
             hwnd,
             hidden,
-            preview: false,
             title_hover: false,
             status,
             focus: cx.focus_handle(),
@@ -236,24 +273,6 @@ impl NxNoteApp {
             editor,
             window,
             |app, editor, event: &InputEvent, window, cx| {
-                if matches!(
-                    event,
-                    InputEvent::PressEnter {
-                        secondary: false,
-                        shift: false
-                    }
-                ) {
-                    let text = editor.read(cx).value().to_string();
-                    let cursor = editor.read(cx).selected_range().end;
-                    if let Some((range, replacement)) =
-                        crate::editor_support::continuation_edit(&text, cursor)
-                    {
-                        editor.update(cx, |state, cx| {
-                            state.set_selected_range(range, cx);
-                            state.replace(replacement, window, cx);
-                        });
-                    }
-                }
                 if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. })
                     && !app.replacing
                 {
@@ -278,11 +297,7 @@ impl NxNoteApp {
         self.editor = Self::make_editor(&self.session.text, window, cx);
         (self.editor_events, self.editor_observer) = Self::watch_editor(&self.editor, window, cx);
         if !self.hidden {
-            if self.preview {
-                self.focus.focus(window, cx);
-            } else {
-                self.editor.update(cx, |state, cx| state.focus(window, cx));
-            }
+            self.editor.update(cx, |state, cx| state.focus(window, cx));
         }
         cx.notify();
     }
@@ -353,11 +368,7 @@ impl NxNoteApp {
         platform::set_visible(self.hwnd, true);
         self.hidden = false;
         window.activate_window();
-        if self.preview {
-            self.focus.focus(window, cx);
-        } else {
-            self.editor.update(cx, |state, cx| state.focus(window, cx));
-        }
+        self.editor.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
 
@@ -715,11 +726,7 @@ impl NxNoteApp {
                 cx.observe_release_in(&view, window, |app, _, window, cx| {
                     if !app.hidden {
                         window.activate_window();
-                        if app.preview {
-                            app.focus.focus(window, cx);
-                        } else {
-                            app.editor.update(cx, |state, cx| state.focus(window, cx));
-                        }
+                        app.editor.update(cx, |state, cx| state.focus(window, cx));
                     }
                 })
                 .detach();
@@ -811,7 +818,7 @@ impl NxNoteApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.preview || !self.editor.focus_handle(cx).is_focused(window) {
+        if !self.editor.focus_handle(cx).is_focused(window) {
             return;
         }
         let text = self.editor.read(cx).value().to_string();
@@ -825,15 +832,6 @@ impl NxNoteApp {
         }
     }
 
-    fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview = !self.preview;
-        if self.preview {
-            self.focus.focus(window, cx);
-        } else {
-            self.editor.update(cx, |state, cx| state.focus(window, cx));
-        }
-        cx.notify();
-    }
 
     fn zoom(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
         self.session.cfg.font_size = (self.session.cfg.font_size + delta).clamp(10., 24.);
@@ -847,6 +845,8 @@ impl NxNoteApp {
 
 impl Render for NxNoteApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let style = theme::document_style(&self.session.cfg, cx);
+        self.editor.update(cx, |editor, _| editor.set_style(style));
         let label = format!(
             "{} / {}",
             self.session.display_name(&self.session.current.folder_key),
@@ -886,15 +886,6 @@ impl Render for NxNoteApp {
             )
             .content(div().flex_1())
             .child(
-                Button::new("preview")
-                    .icon(IconName::Eye)
-                    .selected(self.preview)
-                    .tooltip("编辑 / 预览 (Ctrl+Shift+P)")
-                    .on_click(cx.listener(|app, _, window, cx| {
-                        app.toggle_preview(window, cx);
-                    })),
-            )
-            .child(
                 Button::new("settings")
                     .icon(IconName::Settings)
                     .tooltip("设置")
@@ -919,30 +910,10 @@ impl Render for NxNoteApp {
                         })),
                 )
             }));
-        // The shared editor owns image paste and token rendering.
-        let body = if self.preview {
-            div()
-                .id("markdown-preview")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .p_3()
-                .child(
-                    gpui_kit::base::TextView::markdown(
-                        "note-preview",
-                        self.editor.read(cx).preview_markdown(),
-                    )
-                    .style(theme::preview_style(&self.session.cfg, cx))
-                    .selectable(true),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(self.editor.clone())
-                .into_any_element()
-        };
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .child(self.editor.clone());
         let cursor = self.editor.read(cx).cursor_position();
         let status = StatusBar::new()
             .text_xs()
@@ -998,9 +969,6 @@ impl Render for NxNoteApp {
                 app.edit_lines(crate::editor_support::LineAction::Delete, w, c)
             }))
             .on_action(cx.listener(|app, _: &Quit, window, cx| app.quit(window, cx)))
-            .on_action(cx.listener(|app, _: &TogglePreview, window, cx| {
-                app.toggle_preview(window, cx);
-            }))
             .on_action(cx.listener(|app, _: &ToggleTop, window, cx| {
                 app.session.cfg.always_on_top = !app.session.cfg.always_on_top;
                 platform::set_always_on_top(app.hwnd, app.session.cfg.always_on_top);

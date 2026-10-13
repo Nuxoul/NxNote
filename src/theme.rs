@@ -59,7 +59,7 @@ pub fn color([r, g, b]: [u8; 3]) -> gpui_kit::Hsla {
     gpui_kit::rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
 }
 
-pub fn preview_style(cfg: &Config, cx: &App) -> gpui_kit::base::TextViewStyle {
+pub fn document_style(cfg: &Config, cx: &App) -> gpui_kit::base::TextViewStyle {
     use gpui_kit::component::ActiveTheme;
     use gpui_kit::{HighlightStyle, StyleRefinement, Styled};
     let colors = if cx.theme().is_dark() {
@@ -81,4 +81,5 @@ pub fn preview_style(cfg: &Config, cx: &App) -> gpui_kit::base::TextViewStyle {
             ..Default::default()
         })
         .with_code_block(StyleRefinement::default().text_color(color(colors.code_text)))
+        .with_paragraph_gap(gpui_kit::rems(0.))
 }

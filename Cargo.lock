@@ -4480,6 +4480,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre-reqwest-client",
  "image",
+ "markdown",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -4487,6 +4488,7 @@ dependencies = [
  "toml 0.8.23",
  "tray-icon",
  "ttf-parser",
+ "unicode-segmentation",
  "windows 0.58.0",
  "winresource",
 ]

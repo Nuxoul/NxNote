@@ -76,37 +76,30 @@ impl Attachments {
             }),
         )
     }
-    pub fn content(&self, text: &str) -> InputContent {
-        let mut content = InputContent::new(text.to_string());
+    pub fn references(&self, text: &str) -> Vec<(std::ops::Range<usize>, String)> {
         let mut ranges = Vec::new();
         for path in self.labels.keys() {
             for (start, _) in text.match_indices(path) {
-                ranges.push((start..start + path.len(), path));
+                ranges.push((start..start + path.len(), path.clone()));
             }
         }
         ranges.sort_by(|(a, _), (b, _)| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
         let mut end = 0;
-        for (range, path) in ranges {
-            if range.start < end {
-                continue;
-            }
+        ranges.retain(|(range, _)| {
+            if range.start < end { return false; }
             end = range.end;
-            if let Ok(next) = content.clone().with_token(range, self.token(path)) {
+            true
+        });
+        ranges
+    }
+    pub fn content(&self, text: &str) -> InputContent {
+        let mut content = InputContent::new(text.to_string());
+        for (range, path) in self.references(text) {
+            if let Ok(next) = content.clone().with_token(range, self.token(&path)) {
                 content = next;
             }
         }
         content
-    }
-    pub fn preview_markdown(&self, text: &str) -> String {
-        let mut output = text.to_string();
-        for (path, label) in &self.labels {
-            let src = path.replace('\\', "/").replace(' ', "%20");
-            output = output.replace(
-                path,
-                &format!("![{}](file:///{src})", label.replace(['[', ']'], "")),
-            );
-        }
-        output
     }
 }
 
