@@ -8,7 +8,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     command::{Command, CommandItem, CommandState},
     dialog::{DialogAction, DialogClose, DialogFooter},
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState},
     menu::DropdownMenu,
     notification::{Notification, NotificationType},
     status_bar::StatusBar,
@@ -85,37 +85,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-7", Tab7, Some("NxNote")),
         KeyBinding::new("ctrl-8", Tab8, Some("NxNote")),
         KeyBinding::new("ctrl-9", Tab9, Some("NxNote")),
-        KeyBinding::new(
-            "alt-up",
-            MoveLineUp,
-            Some("NxNote && Input && mode == editor"),
-        ),
-        KeyBinding::new(
-            "alt-down",
-            MoveLineDown,
-            Some("NxNote && Input && mode == editor"),
-        ),
-        KeyBinding::new(
-            "alt-shift-up",
-            CopyLineUp,
-            Some("NxNote && Input && mode == editor"),
-        ),
-        KeyBinding::new(
-            "alt-shift-down",
-            CopyLineDown,
-            Some("NxNote && Input && mode == editor"),
-        ),
-        KeyBinding::new(
-            "ctrl-shift-k",
-            DeleteLines,
-            Some("NxNote && Input && mode == editor"),
-        ),
+        KeyBinding::new("alt-up", MoveLineUp, Some("NxNote && Input")),
+        KeyBinding::new("alt-down", MoveLineDown, Some("NxNote && Input")),
+        KeyBinding::new("alt-shift-up", CopyLineUp, Some("NxNote && Input")),
+        KeyBinding::new("alt-shift-down", CopyLineDown, Some("NxNote && Input")),
+        KeyBinding::new("ctrl-shift-k", DeleteLines, Some("NxNote && Input")),
     ]);
 }
 
 pub struct NxNoteApp {
     pub session: Session,
-    editor: Entity<EditorState>,
+    editor: Entity<crate::note_editor::NoteEditor>,
     editor_events: Subscription,
     editor_observer: Subscription,
     save_task: Option<Task<()>>,
@@ -239,20 +219,16 @@ impl NxNoteApp {
         app
     }
 
-    fn make_editor(text: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<EditorState> {
-        cx.new(|cx| {
-            EditorState::new(window, cx)
-                .language("markdown")
-                .line_number(true)
-                .soft_wrap(true)
-                .auto_close(false)
-                .smart_indent(false)
-                .default_value(text.to_string())
-        })
+    fn make_editor(
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::note_editor::NoteEditor> {
+        cx.new(|cx| crate::note_editor::NoteEditor::new(text, window, cx))
     }
 
     fn watch_editor(
-        editor: &Entity<EditorState>,
+        editor: &Entity<crate::note_editor::NoteEditor>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Subscription, Subscription) {
@@ -943,7 +919,7 @@ impl Render for NxNoteApp {
                         })),
                 )
             }));
-        let paste_editor = self.editor.clone();
+        // The shared editor owns image paste and token rendering.
         let body = if self.preview {
             div()
                 .id("markdown-preview")
@@ -952,34 +928,19 @@ impl Render for NxNoteApp {
                 .overflow_y_scroll()
                 .p_3()
                 .child(
-                    gpui_kit::base::TextView::markdown("note-preview", self.session.text.clone())
-                        .style(theme::preview_style(&self.session.cfg, cx))
-                        .selectable(true),
+                    gpui_kit::base::TextView::markdown(
+                        "note-preview",
+                        self.editor.read(cx).preview_markdown(),
+                    )
+                    .style(theme::preview_style(&self.session.cfg, cx))
+                    .selectable(true),
                 )
                 .into_any_element()
         } else {
             div()
                 .flex_1()
                 .min_h_0()
-                .child(
-                    Editor::new(&self.editor)
-                        .h_full()
-                        .appearance(false)
-                        .bordered(false)
-                        .aria_label("笔记编辑器")
-                        .on_paste(move |item, window, cx| {
-                            if let Some(text) =
-                                item.text().filter(|t| crate::editor_support::image_url(t))
-                            {
-                                paste_editor.update(cx, |state, cx| {
-                                    state.insert(format!("![图片]({})\n", text.trim()), window, cx)
-                                });
-                                true
-                            } else {
-                                false
-                            }
-                        }),
-                )
+                .child(self.editor.clone())
                 .into_any_element()
         };
         let cursor = self.editor.read(cx).cursor_position();

@@ -99,12 +99,10 @@ fn run(sender: Sender<PlatformEvent>, poll_ms: Arc<AtomicU64>) {
         };
 
         if let Some(info) = info {
-            let is_self = info
-                .exe_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(|stem| stem.eq_ignore_ascii_case("nxnote"))
-                .unwrap_or(false);
+            let is_self = std::env::current_exe().ok().is_some_and(|exe| {
+                exe.to_string_lossy()
+                    .eq_ignore_ascii_case(&info.exe_path.to_string_lossy())
+            });
 
             if is_self {
                 last = None;

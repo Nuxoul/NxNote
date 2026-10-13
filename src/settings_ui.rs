@@ -11,7 +11,7 @@ use gpui_kit::component::{
     searchable_list::{SearchableListItem, SearchableVec},
     switch::Switch,
     tab::{Tab, TabBar},
-    ActiveTheme as _, IndexPath as ComponentIndexPath, WindowExt as _,
+    ActiveTheme as _, IndexPath as ComponentIndexPath, TitleBar, WindowExt as _,
 };
 use gpui_kit::{
     div, prelude::*, px, size, App, Bounds, Context, Entity, Hsla, IntoElement, Render, Rgba,
@@ -81,6 +81,7 @@ pub struct SettingsView {
     light_colors: Vec<Entity<ColorPickerState>>,
     on_apply: Rc<ApplyCallback>,
     _subscriptions: Vec<Subscription>,
+    _font_loader: gpui_kit::Task<()>,
 }
 
 pub fn open(
@@ -96,6 +97,7 @@ pub fn open(
         ))),
         titlebar: Some(TitlebarOptions {
             title: Some("NxNote 设置".into()),
+            appears_transparent: true,
             ..Default::default()
         }),
         ..Default::default()
@@ -178,6 +180,47 @@ impl SettingsView {
             );
         }
 
+        let selected_paths: Vec<String> = draft
+            .ui_fonts
+            .iter()
+            .chain(&draft.editor_fonts)
+            .cloned()
+            .collect();
+        let load = cx.background_executor().spawn(async move {
+            let mut paths = selected_paths;
+            paths.extend(
+                fonts::list_system_fonts()
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string()),
+            );
+            paths.sort();
+            paths.dedup();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let label = fonts::font_display_name(Path::new(&path));
+                    (path, label)
+                })
+                .collect::<Vec<_>>()
+        });
+        let font_loader = cx.spawn_in(window, async move |view, cx| {
+            let catalog = load.await;
+            let _ = cx.update(|window, cx| {
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |settings, cx| {
+                        for state in [&settings.ui_fonts, &settings.editor_fonts] {
+                            let selected = state.read(cx).selected_values();
+                            let choices = ordered_font_choices(&selected, &catalog);
+                            state.update(cx, |state, cx| {
+                                state.set_items(SearchableVec::new(choices), window, cx);
+                                state.set_selected_values(&selected, window, cx);
+                            });
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+        });
         Self {
             draft,
             tab: 0,
@@ -195,6 +238,7 @@ impl SettingsView {
             light_colors,
             on_apply,
             _subscriptions: subscriptions,
+            _font_loader: font_loader,
         }
     }
 
@@ -475,6 +519,7 @@ impl Render for SettingsView {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(TitleBar::new().child("NxNote 设置"))
             .child(
                 div().px_6().pt_5().pb_3().child(
                     TabBar::new("settings-sections")
@@ -586,26 +631,8 @@ fn font_state(
     window: &mut Window,
     cx: &mut Context<SettingsView>,
 ) -> Entity<FontState> {
-    let mut paths = Vec::<String>::new();
-    for path in selected {
-        if !paths.contains(path) {
-            paths.push(path.clone());
-        }
-    }
-    let selected_count = paths.len();
-    for path in fonts::list_system_fonts() {
-        let path = path.to_string_lossy().to_string();
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    let choices = paths
-        .into_iter()
-        .map(|path| FontChoice {
-            label: fonts::font_display_name(Path::new(&path)).into(),
-            path,
-        })
-        .collect::<Vec<_>>();
+    let choices = ordered_font_choices(selected, &[]);
+    let selected_count = choices.len();
     let selected_indices = (0..selected_count)
         .map(|row| ComponentIndexPath::default().row(row))
         .collect();
@@ -614,6 +641,39 @@ fn font_state(
             .multiple(true)
             .searchable(true)
     })
+}
+
+fn ordered_font_choices(selected: &[String], catalog: &[(String, String)]) -> Vec<FontChoice> {
+    let mut choices = Vec::<FontChoice>::new();
+    for path in selected {
+        if choices.iter().any(|choice| &choice.path == path) {
+            continue;
+        }
+        let label = catalog
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string()
+            });
+        choices.push(FontChoice {
+            path: path.clone(),
+            label: label.into(),
+        });
+    }
+    for (path, label) in catalog {
+        if !choices.iter().any(|choice| &choice.path == path) {
+            choices.push(FontChoice {
+                path: path.clone(),
+                label: label.clone().into(),
+            });
+        }
+    }
+    choices
 }
 
 fn color_states(
@@ -706,4 +766,27 @@ fn hsla_to_rgb(color: Hsla) -> [u8; 3] {
     let rgba = Rgba::from(color);
     let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
     [channel(rgba.r), channel(rgba.g), channel(rgba.b)]
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+    #[test]
+    fn async_catalog_preserves_selected_order_and_missing_paths() {
+        let selected = vec![
+            "second.ttf".into(),
+            "missing.ttf".into(),
+            "first.ttf".into(),
+        ];
+        let catalog = vec![
+            ("first.ttf".into(), "First".into()),
+            ("second.ttf".into(), "Second".into()),
+            ("third.ttf".into(), "Third".into()),
+        ];
+        let choices = ordered_font_choices(&selected, &catalog);
+        assert_eq!(
+            choices.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["second.ttf", "missing.ttf", "first.ttf", "third.ttf"]
+        );
+    }
 }

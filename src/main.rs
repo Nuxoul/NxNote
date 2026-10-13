@@ -2,12 +2,14 @@
 // GPUI's derives resolve through this alias while all application imports use the Kit facade.
 extern crate gpui_kit as gpui;
 mod app;
+mod attachments;
 mod autostart;
 mod config;
 mod editor_support;
 mod fonts;
 mod fsutil;
 mod hotkey;
+mod note_editor;
 mod platform;
 mod session;
 mod settings_ui;
