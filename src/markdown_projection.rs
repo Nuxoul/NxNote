@@ -3,6 +3,8 @@
 use crate::attachments::Attachments;
 use markdown::{mdast::{AlignKind, Node}, ParseOptions};
 use std::{collections::BTreeMap, ops::Range};
+#[path = "markdown_extension_projection.rs"]
+mod extension_projection;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Marks {
@@ -12,16 +14,35 @@ pub struct Marks {
     pub code: bool,
     pub link: bool,
     pub syntax: bool,
+    pub highlight: bool,
+    /// -1 subscript, 1 superscript, 0 normal baseline.
+    pub script: i8,
+    pub tone: u8,
 }
 #[derive(Clone)]
 pub struct SourceChar {
     pub display: Range<usize>,
     pub source: Range<usize>,
 }
+#[derive(Clone, Debug)]
+pub enum WidgetKind {
+    Math { formula: String, display: bool },
+    Mermaid { diagram: String },
+    Metadata { text: String },
+    NoteEmbed { target: String },
+}
+impl WidgetKind {
+    pub fn key(&self) -> String { format!("{self:?}") }
+}
+#[derive(Clone)]
+pub enum LinkTarget { External(String), Note(String), Footnote(String) }
+#[derive(Clone)]
+pub struct DocumentLink { pub source: Range<usize>, pub target: LinkTarget }
 #[derive(Clone)]
 pub enum Inline {
     Text { text: String, map: Vec<SourceChar>, marks: Marks },
     Image { path: String, label: String, source: Range<usize> },
+    Widget { kind: WidgetKind, source: Range<usize> },
 }
 #[derive(Clone)]
 pub struct Cell {
@@ -41,20 +62,56 @@ pub struct Row {
     pub quote: usize,
     pub marker: Option<String>,
     pub task: Option<(bool, Range<usize>)>,
+    /// Reserve the marker column for actual list content, including explicit continuations.
+    pub list_content: bool,
     pub code: bool,
     pub rule: bool,
     pub table: bool,
     pub table_head: bool,
     pub gap: bool,
+    pub callout: Option<String>,
+    pub annotation: Option<String>,
+}
+impl Row {
+    /// The first list level uses the marker column, not an extra nesting level.
+    pub fn content_inset(&self) -> f32 {
+        let levels = if self.list_content { self.indent.saturating_sub(1) } else { self.indent };
+        levels as f32 * 22. + self.quote as f32 * 14. + if self.list_content { 26. } else { 0. }
+    }
 }
 #[derive(Clone, Default)]
 pub struct Document {
     pub rows: Vec<Row>,
+    pub links: Vec<DocumentLink>,
+    pub footnotes: BTreeMap<String, Range<usize>>,
 }
 impl Document {
-    pub fn new(source: &str, cursor: usize, composing: bool, attachments: &Attachments) -> Self {
-        let mut builder = Builder { source, cursor, composing, attachments, rows: Vec::new(), definitions: BTreeMap::new() };
-        let mut parse_source = source.as_bytes().to_vec();
+    pub fn new(source: &str, cursor: usize, marked: Option<Range<usize>>, attachments: &Attachments) -> Self {
+        Self::with_options(source, cursor, marked, attachments, false)
+    }
+    pub fn with_options(source: &str, cursor: usize, marked: Option<Range<usize>>, attachments: &Attachments, metadata_expanded: bool) -> Self {
+        let extensions = crate::markdown_extensions::Extensions::parse(source);
+        let composing = marked.is_some();
+        let mut builder = Builder { source, cursor, composing, marked: marked.clone(), attachments, rows: Vec::new(), definitions: BTreeMap::new() };
+        let mut parse_source = extensions.mask_inline(source).into_bytes();
+        for block in &extensions.blocks {
+            if matches!(&block.kind, crate::markdown_extensions::BlockKind::FrontMatter | crate::markdown_extensions::BlockKind::Math | crate::markdown_extensions::BlockKind::Mermaid) {
+                for byte in &mut parse_source[block.source.clone()] { if *byte != b'\n' && *byte != b'\r' { *byte = b'x'; } }
+            }
+            if matches!(&block.kind, crate::markdown_extensions::BlockKind::FootnoteDefinition { .. }) {
+                parse_source[block.source.start..block.content.start].fill(b'x');
+            }
+        }
+        if let Some(marked) = marked.filter(|range| range.start <= range.end && range.end <= source.len()) {
+            let mut offset = marked.start;
+            while offset < marked.end {
+                if source[offset..].starts_with("\\|") { offset += 2; continue; }
+                if source[offset..].starts_with("<br>") { offset += 4; continue; }
+                let ch = source[offset..].chars().next().unwrap();
+                if ch.is_ascii_punctuation() && ch != '|' { parse_source[offset] = b'x'; }
+                offset += ch.len_utf8();
+            }
+        }
         let mut protected = Vec::new();
         if let Ok(root) = markdown::to_mdast(source, &ParseOptions::gfm()) { protected_ranges(&root, &mut protected); }
         for (range, _) in attachments.references(source) {
@@ -62,28 +119,28 @@ impl Document {
             parse_source[range].fill(b'x');
         }
         let parse_source = String::from_utf8(parse_source).unwrap_or_else(|_| source.to_string());
+        let mut links = Vec::new();
         match markdown::to_mdast(&parse_source, &ParseOptions::gfm()) {
             Ok(Node::Root(root)) => {
                 collect_definitions(&Node::Root(root.clone()), &mut builder.definitions);
-                let mut end = 0;
+                collect_links(&Node::Root(root.clone()), &builder.definitions, &mut links);
                 for node in &root.children {
-                    let range = node_range(node);
-                    builder.blank_between(end, range.start);
                     builder.block(node, 0, 0, None, None);
-                    end = range.end;
                 }
-                builder.blank_between(end, source.len());
             }
             _ => builder.plain(0..source.len(), 0, 0, false),
         }
+        builder.apply_extensions(&extensions, metadata_expanded, &mut links);
+        builder.fill_blank_lines();
         if builder.rows.is_empty() {
             builder.plain(0..0, 0, 0, false);
         }
-        // A terminal newline always has an editable following line.
-        if source.ends_with('\n') && builder.rows.last().is_none_or(|r| r.source.start != source.len()) {
-            builder.plain(source.len()..source.len(), 0, 0, false);
-        }
-        Self { rows: builder.rows }
+        Self { rows: builder.rows, links, footnotes: extensions.footnotes }
+    }
+    pub fn widgets(&self) -> impl Iterator<Item = (&WidgetKind, &Range<usize>)> {
+        self.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline).filter_map(|inline| {
+            if let Inline::Widget { kind, source } = inline { Some((kind, source)) } else { None }
+        })
     }
     pub fn images(&self) -> impl Iterator<Item = &Range<usize>> {
         self.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.inline).filter_map(|i| {
@@ -103,32 +160,97 @@ struct Builder<'a> {
     source: &'a str,
     cursor: usize,
     composing: bool,
+    marked: Option<Range<usize>>,
     attachments: &'a Attachments,
     rows: Vec<Row>,
     definitions: BTreeMap<String, String>,
 }
 impl Builder<'_> {
     fn row(&self, source: Range<usize>, cells: Vec<Cell>, indent: usize, quote: usize) -> Row {
-        Row { source, cells, heading: 0, indent, quote, marker: None, task: None,
-            code: false, rule: false, table: false, table_head: false, gap: false }
+        Row { source, cells, heading: 0, indent, quote, marker: None, task: None, list_content: false,
+            code: false, rule: false, table: false, table_head: false, gap: false, callout: None, annotation: None }
     }
-    fn blank_between(&mut self, start: usize, end: usize) {
-        let Some(text) = self.source.get(start..end) else { return; };
-        let mut offset = start;
-        // One line break is a block boundary, further line breaks are editable blank lines.
-        let mut first_break = true;
-        for line in text.split_inclusive('\n') {
-            if line.ends_with('\n') {
-                if !first_break {
-                    let mut row = self.row(offset..offset + line.len() - 1,
-                        vec![Cell { source: offset..offset, ..Default::default() }], 0, 0);
-                    row.gap = true;
-                    self.rows.push(row);
+    fn push_text_lines(&mut self, row: Row) {
+        // Physical source lines, not parser Text nodes, define editable rows.
+        // Blank-line reconciliation is independent of AST container spans.
+        let multiline_atom = row.cells.iter().flat_map(|cell| &cell.inline).any(|inline| match inline {
+            Inline::Image { source, .. } | Inline::Widget { source, .. } => self.source.get(source.clone()).is_some_and(|text| text.contains('\n')),
+            Inline::Text { text, map, .. } => map.iter().any(|character| {
+                self.source.get(character.source.clone()).is_some_and(|source| source.contains('\n'))
+                    && text.get(character.display.clone()).is_some_and(|display| display != "\n")
+            }),
+        });
+        if multiline_atom { self.rows.push(row); return; }
+        let mut start = row.source.start;
+        for line in self.source[row.source.clone()].split_inclusive('\n') {
+            let end = start + line.trim_end_matches(['\r', '\n']).len();
+            let mut current = row.clone();
+            current.source = start..end;
+            current.gap = end < row.source.end;
+            let mut inline = Vec::new();
+            for item in &row.cells[0].inline {
+                match item {
+                    Inline::Image { source, .. } | Inline::Widget { source, .. } if source.start >= start && source.end <= end => inline.push(item.clone()),
+                    Inline::Text { text, map, marks } => {
+                        let mut value = String::new();
+                        let mut selected = Vec::new();
+                        for character in map.iter().filter(|character| character.source.start >= start && character.source.end <= end) {
+                            let Some(display) = text.get(character.display.clone()) else { continue; };
+                            let offset = value.len(); value.push_str(display);
+                            selected.push(SourceChar { display: offset..value.len(), source: character.source.clone() });
+                        }
+                        if !value.is_empty() { inline.push(Inline::Text { text: value, map: selected, marks: *marks }); }
+                    }
+                    _ => {}
                 }
-                first_break = false;
             }
-            offset += line.len();
+            let content_start = inline.first().map(inline_start).unwrap_or(start);
+            let content_end = inline.last().map(inline_end).unwrap_or(content_start);
+            current.cells = vec![Cell { source: content_start..content_end, inline, ..Default::default() }];
+            if start != row.source.start { current.marker = None; current.task = None; }
+            self.rows.push(current);
+            start += line.len();
         }
+        if row.source.is_empty() { self.rows.push(row); }
+    }
+    fn fill_blank_lines(&mut self) {
+        // AST container ranges can include blank lines with no child node (lists
+        // in particular). Reconcile physical blank lines against painted rows,
+        // rather than assuming every omitted line is between top-level blocks.
+        let line_start = |offset: usize| self.source[..offset].rfind('\n').map_or(0, |index| index + 1);
+        let mut covered = std::collections::BTreeSet::new();
+        for row in &self.rows {
+            covered.insert(line_start(row.source.start));
+            for inline in row.cells.iter().flat_map(|cell| &cell.inline) {
+                if let Inline::Widget { source, .. } = inline {
+                    let mut offset = source.start;
+                    for line in self.source[source.clone()].split_inclusive('\n') {
+                        covered.insert(line_start(offset)); offset += line.len();
+                    }
+                }
+                if let Inline::Text { text, map, .. } = inline {
+                    for character in map {
+                        if text.get(character.display.clone()).is_some_and(|text| text.contains('\n')) {
+                            covered.insert(line_start(character.source.end));
+                        }
+                    }
+                }
+            }
+        }
+        let mut offset = 0;
+        for line in self.source.split('\n') {
+            let end = offset + line.trim_end_matches('\r').len();
+            if line.trim_matches([' ', '\t', '\r']).is_empty() && !covered.contains(&offset) {
+                let source = offset..end;
+                let mut inline = Vec::new();
+                self.raw(source.clone(), Marks::default(), &mut inline);
+                let mut row = self.row(source.clone(), vec![Cell { source, inline, ..Default::default() }], 0, 0);
+                row.gap = true;
+                self.rows.push(row);
+            }
+            offset += line.len() + 1;
+        }
+        self.rows.sort_by_key(|row| (row.source.start, row.source.end));
     }
     fn plain(&mut self, range: Range<usize>, indent: usize, quote: usize, code: bool) {
         let text = self.source.get(range.clone()).unwrap_or("");
@@ -151,7 +273,11 @@ impl Builder<'_> {
         }
     }
     fn block(&mut self, node: &Node, indent: usize, quote: usize, marker: Option<String>, task: Option<(bool, Range<usize>)>) {
-        let range = node_range(node);
+        let mut range = node_range(node);
+        if matches!(node, Node::Heading(heading) if heading.children.is_empty()) {
+            let line_end = self.source[range.start..].find('\n').map_or(self.source.len(), |end| range.start + end);
+            range.end = range.start + self.source[range.start..line_end].trim_end_matches('\r').len();
+        }
         match node {
             Node::List(list) => {
                 for (index, item) in list.children.iter().enumerate() {
@@ -164,19 +290,83 @@ impl Builder<'_> {
                         let bracket = prefix.find('[')?;
                         Some((checked, item_range.start + bracket + 1..item_range.start + bracket + 2))
                     });
+                    let first_row = self.rows.len();
                     if item.children.is_empty() {
-                        self.plain(item_range.end..item_range.end, indent + 1, quote, false);
-                        if let Some(row) = self.rows.last_mut() { row.marker = Some(marker.clone()); row.task = task.clone(); }
+                        let line_end = self.source[item_range.start..].find('\n').map_or(self.source.len(), |end| item_range.start + end);
+                        let empty_range = item_range.start..line_end;
+                        if !self.composing && self.cursor >= empty_range.start && self.cursor <= empty_range.end {
+                            self.plain(empty_range.clone(), indent, quote, false);
+                        } else {
+                            self.plain(empty_range.end..empty_range.end, indent + 1, quote, false);
+                            if let Some(row) = self.rows.last_mut() { row.marker = Some(marker.clone()); row.task = task.clone(); }
+                        }
                     }
                     for (child_index, child) in item.children.iter().enumerate() {
                         self.block(child, indent + 1, quote,
                             (child_index == 0).then(|| marker.clone()),
                             if child_index == 0 { task.clone() } else { None });
                     }
+                    let content_start = item.children.first().map(node_range).map_or(item_range.end, |range| range.start);
+                    let physical_start = self.source[..item_range.start].rfind('\n').map_or(0, |offset| offset + 1);
+                    let line_end = self.source[physical_start..].find('\n').map_or(self.source.len(), |offset| physical_start + offset);
+                    let prefix = &self.source[physical_start..content_start.min(line_end)];
+                    let prefix = prefix.rsplit('>').next().unwrap_or(prefix);
+                    // Checkbox syntax is content of a task item, not continuation indentation.
+                    let required_indent = prefix.find('[').unwrap_or(prefix.len());
+                    for row in &mut self.rows[first_row..] {
+                        // A nested list owns its own marker column and depth.
+                        if row.indent != indent + 1 { continue; }
+                        let line_start = self.source[..row.source.start].rfind('\n').map_or(0, |offset| offset + 1);
+                        if line_start == physical_start {
+                            row.list_content = true;
+                        } else {
+                            let end = self.source[line_start..].find('\n').map_or(self.source.len(), |offset| line_start + offset);
+                            let line = &self.source[line_start..end];
+                            let body = line.rsplit_once('>').filter(|(prefix, _)| prefix.chars().all(|ch| matches!(ch, '>' | ' ' | '\t')))
+                                .map_or(line, |(_, body)| body);
+                            let columns = body.chars().take_while(|ch| matches!(*ch, ' ' | '\t'))
+                                .fold(0, |columns, ch| if ch == '\t' { columns + 4 - columns % 4 } else { columns + 1 });
+                            row.list_content = columns >= required_indent;
+                            // GFM permits lazy, unindented list continuations. In
+                            // this editor they read as normal physical text lines.
+                            if !row.list_content { row.indent = 0; }
+                        }
+                    }
+                    if !item.children.is_empty() {
+                        let content_start = node_range(&item.children[0]).start;
+                        if let Some(row) = self.rows.get_mut(first_row) { row.source.start = item_range.start; }
+                        if !self.composing && self.cursor >= item_range.start && self.cursor < content_start {
+                            let mut prefix = Vec::new();
+                            self.raw(item_range.start..content_start, Marks { syntax: true, ..Default::default() }, &mut prefix);
+                            if let Some(row) = self.rows.get_mut(first_row) {
+                                if let Some(cell) = row.cells.first_mut() {
+                                    prefix.append(&mut cell.inline); cell.inline = prefix;
+                                }
+                                row.marker = None; row.task = None; row.list_content = false;
+                                row.indent = indent;
+                            }
+                        }
+                    }
                 }
             }
             Node::Blockquote(block) => {
+                let first_row = self.rows.len();
                 for child in &block.children { self.block(child, indent, quote + 1, None, None); }
+                if self.rows.len() == first_row { self.plain(range.clone(), indent, quote, false); }
+                for index in first_row..self.rows.len() {
+                    let row_start = self.rows[index].source.start;
+                    let line_start = self.source[..row_start].rfind('\n').map_or(0, |offset| offset + 1);
+                    let prefix = &self.source[line_start..row_start];
+                    if !self.composing && self.cursor >= line_start && self.cursor <= row_start && prefix.contains('>') {
+                        let mut inline = Vec::new();
+                        self.raw(line_start..row_start, Marks { syntax: true, ..Default::default() }, &mut inline);
+                        let row = &mut self.rows[index];
+                        if let Some(cell) = row.cells.first_mut() {
+                            inline.append(&mut cell.inline); cell.inline = inline;
+                        }
+                        row.source.start = line_start; row.quote = 0;
+                    }
+                }
             }
             Node::Table(table) => {
                 for (index, row_node) in table.children.iter().enumerate() {
@@ -206,10 +396,19 @@ impl Builder<'_> {
                     self.rows.push(row);
                 }
             }
-            Node::Code(_) => {
+            Node::Code(code) => {
                 let source = &self.source[range.clone()];
                 let lines: Vec<&str> = source.split_inclusive('\n').collect();
                 let fenced = source.trim_start().starts_with("```") || source.trim_start().starts_with("~~~");
+                let opening_end = range.start + lines.first().map_or(0, |line| line.trim_end_matches(['\r', '\n']).len());
+                let last_start = range.start + lines.iter().take(lines.len().saturating_sub(1)).map(|line| line.len()).sum::<usize>();
+                let closing = lines.len() > 1 && lines.last().is_some_and(|line| line.trim_start().starts_with(&source.trim_start().chars().next().unwrap_or('`').to_string().repeat(3)));
+                if fenced && !self.composing && ((self.cursor >= range.start && self.cursor <= opening_end)
+                    || closing && self.cursor >= last_start && self.cursor <= range.end) {
+                    let first = self.rows.len();
+                    self.plain(range.clone(), indent, quote, true);
+                    self.color_code_rows(first, range.clone(), code.lang.as_deref().unwrap_or("")); return;
+                }
                 let mut offset = range.start;
                 let fence = source.trim_start().chars().next().unwrap_or('`');
                 let initial_rows = self.rows.len();
@@ -226,10 +425,15 @@ impl Builder<'_> {
                     let end = range.start + lines.first().map_or(0, |line| line.len());
                     self.plain(end..end, indent, quote, true);
                 }
+                self.color_code_rows(initial_rows, range.clone(), code.lang.as_deref().unwrap_or(""));
             }
             Node::ThematicBreak(_) => {
-                let mut row = self.row(range.clone(), vec![Cell { source: range, ..Default::default() }], indent, quote);
-                row.rule = true; self.rows.push(row);
+                if !self.composing && self.cursor >= range.start && self.cursor <= range.end {
+                    self.plain(range, indent, quote, false);
+                } else {
+                    let mut row = self.row(range.clone(), vec![Cell { source: range, ..Default::default() }], indent, quote);
+                    row.rule = true; self.rows.push(row);
+                }
             }
             Node::Definition(_) => {} // Reference definitions are source metadata, not a separate reading block.
             _ => {
@@ -238,21 +442,33 @@ impl Builder<'_> {
                     for child in children { self.inline(child, Marks::default(), &mut inline); }
                 } else { self.raw(range.clone(), Marks::default(), &mut inline); }
                 let heading = if let Node::Heading(heading) = node { heading.depth } else { 0 };
-                let visible_start = inline.first().map(inline_start).unwrap_or(range.start);
-                if heading > 0 && self.cursor >= range.start && self.cursor < visible_start && !self.composing {
+                let visible_start = inline.first().map(inline_start).unwrap_or(if heading > 0 { range.end } else { range.start });
+                if heading > 0 && self.cursor >= range.start && self.cursor <= visible_start && !self.composing {
                     let mut prefix = Vec::new();
                     self.raw(range.start..visible_start, Marks { syntax: true, ..Default::default() }, &mut prefix);
                     prefix.extend(inline); inline = prefix;
                 }
+                let visible_end = inline.last().map(inline_end).unwrap_or(visible_start);
+                if heading > 0 && visible_end < range.end {
+                    let suffix = &self.source[visible_end..range.end];
+                    // Setext underline lines remain editable source rows. ATX
+                    // closing hashes reveal only when the caret touches them.
+                    if suffix.contains('\n') || !self.composing && self.cursor >= visible_end && self.cursor <= range.end {
+                        self.raw(visible_end..range.end, Marks { syntax: true, ..Default::default() }, &mut inline);
+                    }
+                }
                 let cell_source = if heading > 0 { visible_start..range.end } else { range.clone() };
                 let mut row = self.row(range.clone(), vec![Cell { source: cell_source, inline, ..Default::default() }], indent, quote);
                 row.heading = heading; row.marker = marker; row.task = task;
-                self.rows.push(row);
+                self.push_text_lines(row);
             }
         }
     }
     fn inline(&self, node: &Node, mut marks: Marks, output: &mut Vec<Inline>) {
         let range = node_range(node);
+        if matches!(node, Node::Text(_)) && self.marked.as_ref().is_some_and(|marked| marked.start < range.end && marked.end > range.start) {
+            self.raw(range, marks, output); return;
+        }
         if matches!(node, Node::Text(_)) && !self.attachments.references(self.source.get(range.clone()).unwrap_or("")).is_empty() {
             self.raw(range, marks, output); return;
         }
@@ -278,8 +494,8 @@ impl Builder<'_> {
                 let raw = &self.source[range.clone()];
                 let ticks = raw.bytes().take_while(|b| *b == b'`').count();
                 let inner = range.start + ticks..range.end.saturating_sub(ticks);
-                if (self.cursor > range.start && self.cursor < inner.start)
-                    || (self.cursor > inner.end && self.cursor < range.end) {
+                if !self.composing && ((self.cursor >= range.start && self.cursor <= inner.start)
+                    || (self.cursor >= inner.end && self.cursor <= range.end)) {
                     self.raw(range, marks, output);
                 } else { self.decoded(&code.value, inner, marks, output); }
             }
@@ -293,7 +509,8 @@ impl Builder<'_> {
                 let Some(children) = node.children() else { return; };
                 let open = children.first().map(node_range).map_or(range.end, |r| r.start);
                 let close = children.last().map(node_range).map_or(range.start, |r| r.end);
-                let reveal = self.cursor > range.start && self.cursor < range.end && !self.composing;
+                let reveal = !self.composing && ((self.cursor >= range.start && self.cursor <= open)
+                    || (self.cursor >= close && self.cursor <= range.end));
                 if reveal { self.raw(range.start..open, Marks { syntax: true, ..marks }, output); }
                 for child in children { self.inline(child, marks, output); }
                 if reveal { self.raw(close..range.end, Marks { syntax: true, ..marks }, output); }
@@ -411,14 +628,23 @@ pub fn node_range(node: &Node) -> Range<usize> {
 fn inline_start(inline: &Inline) -> usize {
     match inline {
         Inline::Text { map, .. } => map.first().map_or(0, |m| m.source.start),
-        Inline::Image { source, .. } => source.start,
+        Inline::Image { source, .. } | Inline::Widget { source, .. } => source.start,
     }
 }
 fn inline_end(inline: &Inline) -> usize {
     match inline {
         Inline::Text { map, .. } => map.last().map_or(0, |m| m.source.end),
-        Inline::Image { source, .. } => source.end,
+        Inline::Image { source, .. } | Inline::Widget { source, .. } => source.end,
     }
+}
+fn collect_links(node: &Node, definitions: &BTreeMap<String, String>, links: &mut Vec<DocumentLink>) {
+    let target = match node {
+        Node::Link(link) => Some(link.url.clone()),
+        Node::LinkReference(link) => definitions.get(&link.identifier.to_lowercase()).cloned(),
+        _ => None,
+    };
+    if let Some(target) = target { links.push(DocumentLink { source: node_range(node), target: LinkTarget::External(target) }); }
+    if let Some(children) = node.children() { for child in children { collect_links(child, definitions, links); } }
 }
 fn collect_definitions(node: &Node, definitions: &mut BTreeMap<String, String>) {
     if let Node::Definition(definition) = node { definitions.insert(definition.identifier.to_lowercase(), definition.url.clone()); }
@@ -429,5 +655,123 @@ fn protected_ranges(node: &Node, ranges: &mut Vec<Range<usize>>) {
         ranges.push(node_range(node));
     } else if let Some(children) = node.children() {
         for child in children { protected_ranges(child, ranges); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_every_blank_line_after_markdown() {
+        for prefix in ["- 东蒙嵩", "# 标题", "-", "#", ""] {
+            let source = format!("{prefix}{}", "\n".repeat(16));
+            let document = Document::new(&source, source.len(), None, &Attachments::default());
+            for (index, _) in source.match_indices('\n') {
+                let start = index + 1;
+                assert!(document.rows.iter().any(|row| row.source.start == start),
+                    "missing editable blank line at {start} in {source:?}");
+            }
+            assert_eq!(document.rows.len(), 17, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_leading_and_nested_list_blank_lines() {
+        for source in ["\n\n# 标题", "- first\n\n  second\n\n- third", "- first\n\n\n- second", "- first\n  \n  second"] {
+            let document = Document::new(source, source.len(), None, &Attachments::default());
+            let mut start = 0;
+            for line in source.split('\n') {
+                if line.trim().is_empty() {
+                    let visible = document.rows.iter().any(|row| row.source.start == start)
+                        || document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline).any(|inline| {
+                            if let Inline::Text { text, map, .. } = inline {
+                                map.iter().any(|character| character.source.end == start
+                                    && text.get(character.display.clone()).is_some_and(|text| text.contains('\n')))
+                            } else { false }
+                        });
+                    assert!(visible, "{source:?} at {start}");
+                }
+                start += line.len() + 1;
+            }
+        }
+    }
+
+    #[test]
+    fn reveals_empty_heading_and_list_markers_at_caret() {
+        for source in ["#", "##", "# ", "##  ", "-", "- "] {
+            let document = Document::new(source, source.len(), None, &Attachments::default());
+            let visible: String = document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline)
+                .filter_map(|inline| if let Inline::Text { text, .. } = inline { Some(text.as_str()) } else { None }).collect();
+            assert_eq!(visible, source, "{source:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use super::*;
+    fn text(document: &Document) -> String {
+        document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline)
+            .filter_map(|inline| if let Inline::Text { text, .. } = inline { Some(text.as_str()) } else { None }).collect()
+    }
+    #[test]
+    fn physical_paragraph_lines_have_distinct_rows() {
+        let source = "first\nsecond\nthird";
+        let document = Document::new(source, source.len(), None, &Attachments::default());
+        assert_eq!(document.rows.iter().map(|row| row.source.start).collect::<Vec<_>>(), vec![0, 6, 13]);
+        assert_eq!(text(&document), "firstsecondthird");
+    }
+    #[test]
+    fn quote_markers_and_fences_are_editable_at_their_edges() {
+        for source in ["> text", "> > text", "```\ncode\n```", "---"] {
+            let document = Document::new(source, 0, None, &Attachments::default());
+            assert!(text(&document).starts_with(source.split('\n').next().unwrap()), "{source:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod list_alignment_tests {
+    use super::*;
+    fn row_at<'a>(document: &'a Document, source: &str, value: &str) -> &'a Row {
+        let start = source.find(value).unwrap();
+        document.rows.iter().find(|row| row.source.start <= start && row.source.end >= start).unwrap()
+    }
+    #[test]
+    fn top_level_marker_has_no_extra_nesting_indent_and_plain_line_resets() {
+        let source = "- 23\n- 32\n- 32\n1. 32\n你好\n";
+        let document = Document::new(source, source.len(), None, &Attachments::default());
+        for row in document.rows.iter().filter(|row| row.marker.is_some()) {
+            assert!(row.list_content);
+            assert_eq!(row.content_inset(), 26.);
+        }
+        let plain = row_at(&document, source, "你好");
+        assert!(!plain.list_content);
+        assert_eq!(plain.content_inset(), 0.);
+    }
+    #[test]
+    fn explicitly_indented_continuation_aligns_with_list_text() {
+        for source in ["- item\n  continuation\nplain", "1. item\n   continuation\nplain", "- [x] item\n  continuation\nplain"] {
+            let document = Document::new(source, source.len(), None, &Attachments::default());
+            assert_eq!(row_at(&document, source, "item").content_inset(), 26.);
+            assert_eq!(row_at(&document, source, "continuation").content_inset(), 26.);
+            assert_eq!(row_at(&document, source, "plain").content_inset(), 0.);
+        }
+    }
+    #[test]
+    fn nested_lists_keep_only_the_real_nesting_offset() {
+        let source = "- outer\n  - inner\n\nplain";
+        let document = Document::new(source, source.len(), None, &Attachments::default());
+        assert_eq!(row_at(&document, source, "outer").content_inset(), 26.);
+        assert_eq!(row_at(&document, source, "inner").content_inset(), 48.);
+        assert_eq!(row_at(&document, source, "plain").content_inset(), 0.);
+    }
+    #[test]
+    fn revealed_list_source_starts_at_the_normal_text_edge() {
+        let source = "- item";
+        let document = Document::new(source, 0, None, &Attachments::default());
+        assert_eq!(document.rows[0].content_inset(), 0.);
+        assert!(document.rows[0].marker.is_none());
     }
 }

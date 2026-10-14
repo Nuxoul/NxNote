@@ -7,6 +7,8 @@ use gpui_kit::{prelude::*, *};
 use markdown::mdast::AlignKind;
 use std::{cell::RefCell, collections::BTreeMap, ops::Range, path::PathBuf, rc::Rc, time::Duration};
 use unicode_segmentation::UnicodeSegmentation;
+#[path = "markdown_widget_layout.rs"]
+mod widget_layout;
 
 #[derive(Clone, Copy)]
 pub struct CaretStop {
@@ -102,24 +104,32 @@ impl DocumentGeometry {
     }
 
     pub fn source_steps(&self) -> Vec<usize> {
-        let mut steps: Vec<_> = self.rows.values().flat_map(|r| &r.lines)
-            .flat_map(|l| &l.stops).map(|s| s.source).collect();
+        let mut steps: Vec<_> = self.rows.values().flat_map(|row| &row.lines).flat_map(|line| {
+            line.stops.iter().filter(move |stop| line.spans.is_empty() || line.spans.iter().any(|span| {
+                !span.source.is_empty() && (stop.source == span.source.start || stop.source == span.source.end)
+            })).map(|stop| stop.source)
+        }).collect();
         steps.sort_unstable(); steps.dedup(); steps
-    }
-    /// Delete a painted grapheme, never the concealed Markdown between glyphs.
-    pub fn deletion_range(&self, source: usize, backwards: bool) -> Option<Range<usize>> {
-        let spans = self.rows.values().flat_map(|row| &row.lines).flat_map(|line| &line.spans);
-        if backwards {
-            spans.filter(|span| span.source.start < source && span.source.end <= source)
-                .max_by_key(|span| span.source.end).map(|span| span.source.clone())
-        } else {
-            spans.filter(|span| span.source.end > source && span.source.start >= source)
-                .min_by_key(|span| span.source.start).map(|span| span.source.clone())
-        }
     }
 
     pub fn selection(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         self.rows.values().flat_map(|r| selection_quads(r, &range)).collect()
+    }
+    /// Native IME geometry is anchored to one visual line, just as GPUI/Zed
+    /// candidate placement is. Do not combine the next line's x coordinate.
+    pub fn input_bounds(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
+        let start = self.caret(range.start)?;
+        let quads = self.selection(range.clone());
+        let mut left = start.position.x;
+        let mut right = left + px(1.);
+        let mut height = start.height;
+        for quad in quads.iter().filter(|quad| (quad.top() - start.position.y).abs() < px(0.5)) {
+            left = left.min(quad.left()); right = right.max(quad.right()); height = height.max(quad.size.height);
+        }
+        if let Some(end) = self.caret(range.end).filter(|end| (end.position.y - start.position.y).abs() < px(0.5)) {
+            right = right.max(end.position.x);
+        }
+        Some(Bounds::new(point(left, start.position.y), size((right - left).max(px(1.)), height)))
     }
 }
 fn distance_to_interval(value: Pixels, start: Pixels, end: Pixels) -> Pixels {
@@ -170,6 +180,8 @@ pub struct DocumentRow {
     pub caret_visible: bool,
     pub font: Font,
     pub font_size: Pixels,
+    pub gutter_width: Pixels,
+    pub widgets: crate::note_editor::WidgetViews,
 }
 
 #[derive(Clone, Default)]
@@ -209,6 +221,7 @@ struct TextFragment {
     line: ShapedLine,
     // Relative x and exact source spans, already restricted to grapheme boundaries.
     graphemes: Vec<(Range<usize>, Pixels, Pixels)>,
+    baseline_offset: Pixels,
 }
 #[derive(Clone)]
 enum PlacedContent { Text(TextFragment), Chip(usize) }
@@ -240,7 +253,6 @@ struct Metrics {
     padding: Pixels,
     bottom: Pixels,
     style: TextViewStyle,
-    heading: bool,
     code: bool,
     table: bool,
 }
@@ -248,6 +260,7 @@ struct Metrics {
 pub struct RowLayoutState {
     children: Vec<Child>,
     task: Option<usize>,
+    annotation: Option<usize>,
     cells: Vec<FlowCell>,
     metrics: Metrics,
     layout: FlowLayout,
@@ -286,7 +299,11 @@ impl DocumentRow {
             .into_any_element()
     }
     fn make_state(&self, window: &Window) -> RowLayoutState {
-        let font_size = self.font_size * match self.row.heading { 1 => 1.8, 2 => 1.5, 3 => 1.3, 4 => 1.15, _ => 1. };
+        let (scale, line_height) = crate::theme::markdown_metrics(self.row.heading);
+        let font_size = if self.row.heading > 0 {
+            self.style.heading(self.row.heading).text.font_size
+                .map_or(self.font_size * scale, |size| size.to_pixels(window.rem_size()))
+        } else { self.font_size };
         let padding = if self.row.table { px(8.) } else if self.row.code { px(6.) } else { px(2.) };
         let mut row_style = self.style.clone();
         if self.row.heading > 0 {
@@ -294,27 +311,42 @@ impl DocumentRow {
         } else if self.row.code {
             if let Some(color) = self.style.code_block().text.color { row_style = row_style.with_foreground(color); }
         } else if self.row.quote > 0 { row_style = row_style.with_foreground(self.style.muted_foreground()); }
+        let mut row_font = self.font.clone();
+        if self.row.heading > 0 {
+            row_font.weight = self.style.heading(self.row.heading).text.font_weight.unwrap_or(FontWeight::SEMIBOLD);
+        }
         let metrics = Metrics {
-            font: self.font.clone(), size: font_size, line_height: font_size * 1.55,
-            left: px(self.row.indent as f32 * 22. + self.row.quote as f32 * 14.
-                + if self.row.marker.is_some() || self.row.task.is_some() { 26. } else { 0. }),
+            font: row_font, size: font_size, line_height: font_size * line_height,
+            left: self.gutter_width + px(self.row.content_inset()),
             padding, bottom: if self.row.table || self.row.code || self.row.gap { px(0.) }
                 else { self.style.paragraph_gap().to_pixels(window.rem_size()) },
-            style: row_style, heading: self.row.heading > 0, code: self.row.code, table: self.row.table,
+            style: row_style, code: self.row.code, table: self.row.table,
         };
-        let mut state = RowLayoutState { children: Vec::new(), task: None, cells: Vec::new(), metrics, layout: FlowLayout::default() };
+        let mut state = RowLayoutState { children: Vec::new(), task: None, annotation: None, cells: Vec::new(), metrics, layout: FlowLayout::default() };
         for cell in &self.row.cells {
             let mut atoms = Vec::new();
             let mut text = MappedText::default();
             for inline in &cell.inline {
                 match inline {
-                    Inline::Text { text: value, map, marks } => text.append(value, map, *marks),
+                    Inline::Text { text: value, map, marks } => {
+                        if marks.script != 0 {
+                            if !text.text.is_empty() { atoms.push(Atom::Text(std::mem::take(&mut text))); }
+                            let mut script = MappedText::default(); script.append(value, map, *marks); atoms.push(Atom::Text(script));
+                        } else { text.append(value, map, *marks); }
+                    }
                     Inline::Image { path, label, source } => {
                         if !text.text.is_empty() { atoms.push(Atom::Text(std::mem::take(&mut text))); }
                         let index = state.children.len();
                         let columns = if self.row.table { self.row.cells.len().max(1) } else { 1 };
                         let maximum_width = ((window.viewport_size().width - px(24.) - state.metrics.left) / columns as f32 - state.metrics.padding * 2.).max(px(28.));
                         state.children.push(Child { element: self.chip(path, label, source.clone(), maximum_width), size: size(px(0.), px(0.)), source: source.clone() });
+                        atoms.push(Atom::Chip(index));
+                    }
+                    Inline::Widget { kind, source } => {
+                        if !text.text.is_empty() { atoms.push(Atom::Text(std::mem::take(&mut text))); }
+                        let index = state.children.len();
+                        let maximum_width = (window.viewport_size().width - px(24.) - state.metrics.left - state.metrics.padding * 2.).max(px(28.));
+                        state.children.push(Child { element: self.widget(kind, source.clone(), maximum_width), size: size(px(0.), px(0.)), source: source.clone() });
                         atoms.push(Atom::Chip(index));
                     }
                 }
@@ -338,6 +370,11 @@ impl DocumentRow {
                 }).into_any_element();
             state.task = Some(state.children.len());
             state.children.push(Child { element, source: 0..0, size: size(px(18.), px(18.)) });
+        }
+        if let Some(label) = &self.row.annotation {
+            state.annotation = Some(state.children.len());
+            state.children.push(Child { element: self.annotation(label, window.viewport_size().width - state.metrics.left),
+                source: 0..0, size: size(px(0.), px(0.)) });
         }
         state
     }
@@ -393,6 +430,10 @@ impl Element for DocumentRow {
             let origin = bounds.origin + point(state.metrics.left - px(23.), state.metrics.padding + (state.metrics.line_height - px(18.)) / 2.);
             state.children[index].element.prepaint_at(origin, window, cx);
         }
+        if let Some(index) = state.annotation {
+            let origin = bounds.origin + point(state.metrics.left, state.metrics.padding);
+            state.children[index].element.prepaint_at(origin, window, cx);
+        }
         // Row edges represent concealed block syntax; ordinary navigation uses mapped graphemes.
         add_row_edges(&mut geometry, &self.row.source);
         self.geometry.borrow_mut().rows.insert(self.index, geometry.clone());
@@ -405,11 +446,18 @@ impl Element for DocumentRow {
         prepaint: &mut Self::PrepaintState, window: &mut Window, cx: &mut App) {
         let mut state = state.borrow_mut();
         let content_height = state.layout.height - state.metrics.bottom;
+        if let Some(kind) = &self.row.callout {
+            let color = widget_layout::callout_color(kind);
+            window.paint_quad(fill(Bounds::new(bounds.origin + point(self.gutter_width, px(0.)),
+                size((bounds.size.width - self.gutter_width).max(px(0.)), content_height)), color.opacity(0.08)));
+            window.paint_quad(fill(Bounds::new(bounds.origin + point(self.gutter_width, px(0.)), size(px(3.), content_height)), color));
+        }
         if self.row.code || self.row.table_head {
-            window.paint_quad(fill(Bounds::new(bounds.origin, size(bounds.size.width, content_height)), self.style.code_background()));
+            window.paint_quad(fill(Bounds::new(bounds.origin + point(self.gutter_width, px(0.)),
+                size((bounds.size.width - self.gutter_width).max(px(0.)), content_height)), self.style.code_background()));
         }
         for quote in 0..self.row.quote {
-            window.paint_quad(fill(Bounds::new(bounds.origin + point(px(quote as f32 * 14. + 3.), px(0.)), size(px(3.), content_height)), self.style.border()));
+            window.paint_quad(fill(Bounds::new(bounds.origin + point(self.gutter_width + px(quote as f32 * 14. + 3.), px(0.)), size(px(3.), content_height)), self.style.border()));
         }
         if self.row.rule {
             window.paint_quad(fill(Bounds::new(bounds.origin + point(state.metrics.left, content_height / 2.), size((bounds.size.width - state.metrics.left).max(px(1.)), px(1.))), self.style.border()));
@@ -421,7 +469,7 @@ impl Element for DocumentRow {
         for line in &state.layout.lines {
             for item in &line.items {
                 if let PlacedContent::Text(fragment) = &item.content {
-                    let _ = fragment.line.paint_background(bounds.origin + line.origin + point(item.x, px(0.)), line.height, TextAlign::Left, None, window, cx);
+                    let _ = fragment.line.paint_background(bounds.origin + line.origin + point(item.x, fragment.baseline_offset), line.height, TextAlign::Left, None, window, cx);
                 }
             }
         }
@@ -429,7 +477,7 @@ impl Element for DocumentRow {
         for line in &state.layout.lines {
             for item in &line.items {
                 if let PlacedContent::Text(fragment) = &item.content {
-                    let _ = fragment.line.paint(bounds.origin + line.origin + point(item.x, px(0.)), line.height, TextAlign::Left, None, window, cx);
+                    let _ = fragment.line.paint(bounds.origin + line.origin + point(item.x, fragment.baseline_offset), line.height, TextAlign::Left, None, window, cx);
                 }
             }
         }
@@ -465,15 +513,20 @@ impl Element for DocumentRow {
 
 fn make_run(len: usize, marks: Marks, metrics: &Metrics) -> TextRun {
     let mut font = metrics.font.clone();
-    if marks.bold || metrics.heading { font.weight = FontWeight::BOLD; }
+    if marks.bold { font.weight = FontWeight::BOLD; }
     if marks.italic { font.style = FontStyle::Italic; }
     if marks.code || metrics.code { font.family = metrics.font.family.clone(); }
-    let color = if marks.syntax { metrics.style.muted_foreground() }
+    let color = if marks.tone > 0 { match marks.tone {
+        1 => rgb(0x7b8b8f).into(), 2 => rgb(0xb887d8).into(), 3 => rgb(0x86b982).into(),
+        4 => rgb(0xd4a571).into(), 5 => rgb(0x6baecb).into(), 6 => rgb(0xd9bf76).into(),
+        7 => rgb(0x91a5bc).into(), _ => metrics.style.foreground(),
+    } } else if marks.syntax { metrics.style.muted_foreground() }
         else if marks.link { metrics.style.link() }
         else if marks.code { metrics.style.inline_code().color.unwrap_or(metrics.style.foreground()) }
         else { metrics.style.foreground() };
     TextRun { len, font, color,
-        background_color: if marks.code && !metrics.code { Some(metrics.style.inline_code().background_color.unwrap_or(metrics.style.code_background())) } else { None },
+        background_color: if marks.highlight { Some(rgb(0xd8b72b).opacity(0.25).into()) }
+            else if marks.code && !metrics.code { Some(metrics.style.inline_code().background_color.unwrap_or(metrics.style.code_background())) } else { None },
         underline: marks.link.then_some(UnderlineStyle { color: Some(color), thickness: px(1.), wavy: false }),
         strikethrough: marks.strike.then_some(StrikethroughStyle { color: Some(color), thickness: px(1.) }),
     }
@@ -487,7 +540,8 @@ fn shape_fragment(text: &MappedText, range: Range<usize>, metrics: &Metrics, win
         (start < end).then(|| make_run(end - start, *marks, metrics))
     }).collect();
     let value = &text.text[range.clone()];
-    let line = window.text_system().shape_line(value.to_owned().into(), metrics.size, &runs, None);
+    let script = text.styles.iter().find(|(span, _)| span.start <= range.start && span.end > range.start).map_or(0, |(_, marks)| marks.script);
+    let line = window.text_system().shape_line(value.to_owned().into(), if script == 0 { metrics.size } else { metrics.size * 0.75 }, &runs, None);
     let boundaries: Vec<_> = value.grapheme_indices(true).map(|(index, _)| index).chain(std::iter::once(value.len())).collect();
     // Interpolate only *inside* a shaped glyph cluster (e.g. ffi ligatures).
     // Cluster endpoints come from the very same shaped line used for painting.
@@ -508,7 +562,7 @@ fn shape_fragment(text: &MappedText, range: Range<usize>, metrics: &Metrics, win
     let graphemes = boundaries.windows(2).enumerate().filter_map(|(index, pair)| {
         text.source_for(range.start + pair[0]..range.start + pair[1]).map(|source| (source, positions[index], positions[index + 1]))
     }).collect();
-    TextFragment { line, graphemes }
+    TextFragment { line, graphemes, baseline_offset: if script > 0 { -metrics.size * 0.22 } else if script < 0 { metrics.size * 0.22 } else { px(0.) } }
 }
 
 fn new_line(cell: usize, x: Pixels, y: Pixels, width: Pixels, metrics: &Metrics, source: usize) -> FlowLine {
@@ -533,7 +587,8 @@ fn layout_row(state: &mut RowLayoutState, width: Pixels, window: &Window) {
     for (cell_index, cell) in state.cells.iter().enumerate() {
         let cell_x = metrics.left + column_width * if metrics.table { cell_index as f32 } else { 0. };
         let x = cell_x + metrics.padding;
-        let mut line = new_line(cell_index, x, metrics.padding, inner_width, metrics, cell.source.start);
+        let content_y = metrics.padding + state.annotation.map_or(px(0.), |index| state.children[index].size.height + px(4.));
+        let mut line = new_line(cell_index, x, content_y, inner_width, metrics, cell.source.start);
         let mut next_source = cell.source.start;
         for atom in &cell.atoms {
             match atom {
@@ -552,7 +607,7 @@ fn layout_row(state: &mut RowLayoutState, width: Pixels, window: &Window) {
                     while offset < text.text.len() {
                         if text.text[offset..].starts_with('\n') {
                             let source = text.source_for(offset..offset + 1).unwrap_or(next_source..next_source);
-                            let fragment = TextFragment { line: shape_plain("", metrics, window), graphemes: vec![(source.clone(), px(0.), px(2.))] };
+                            let fragment = TextFragment { line: shape_plain("", metrics, window), graphemes: vec![(source.clone(), px(0.), px(2.))], baseline_offset: px(0.) };
                             line.items.push(Placed { x: line.used, content: PlacedContent::Text(fragment) });
                             next_source = source.end;
                             let y = finish_line(line, cell.align, &mut layout.lines);
@@ -626,10 +681,11 @@ fn row_geometry(state: &RowLayoutState, row: &Row, origin: Point<Pixels>) -> Row
             let x = position.x + item.x;
             match &item.content {
                 PlacedContent::Text(fragment) => {
+                    let text_y = position.y + fragment.baseline_offset;
                     for (source, left, right) in &fragment.graphemes {
-                        geometry.stops.push(CaretStop { source: source.start, position: point(x + *left, position.y), height: line.height });
-                        geometry.stops.push(CaretStop { source: source.end, position: point(x + *right, position.y), height: line.height });
-                        geometry.spans.push(SourceQuad { source: source.clone(), bounds: Bounds::new(point(x + (*left).min(*right), position.y), size((*right - *left).abs().max(px(1.)), line.height)) });
+                        geometry.stops.push(CaretStop { source: source.start, position: point(x + *left, text_y), height: line.height });
+                        geometry.stops.push(CaretStop { source: source.end, position: point(x + *right, text_y), height: line.height });
+                        geometry.spans.push(SourceQuad { source: source.clone(), bounds: Bounds::new(point(x + (*left).min(*right), text_y), size((*right - *left).abs().max(px(1.)), line.height)) });
                     }
                 }
                 PlacedContent::Chip(index) => {

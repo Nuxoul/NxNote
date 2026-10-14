@@ -25,6 +25,16 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[derive(Clone)]
+struct DragNoteTab { tab: OpenTab, label: SharedString }
+impl Render for DragNoteTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().px_3().py_2().rounded_md().border_1().border_color(cx.theme().border)
+            .bg(cx.theme().background).text_color(cx.theme().foreground)
+            .text_size(cx.theme().font_size).child(self.label.clone())
+    }
+}
+
 actions!(
     nxnote,
     [
@@ -48,6 +58,7 @@ actions!(
         CopyLineUp,
         CopyLineDown,
         DeleteLines,
+        ClearFormatting,
         Tab1,
         Tab2,
         Tab3,
@@ -84,19 +95,20 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-7", Tab7, Some("NxNote")),
         KeyBinding::new("ctrl-8", Tab8, Some("NxNote")),
         KeyBinding::new("ctrl-9", Tab9, Some("NxNote")),
-        KeyBinding::new("alt-up", MoveLineUp, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("alt-down", MoveLineDown, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("alt-shift-up", CopyLineUp, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("alt-shift-down", CopyLineDown, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-k", DeleteLines, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-a", gpui_kit::base::input::SelectAll, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-c", gpui_kit::base::input::Copy, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-x", gpui_kit::base::input::Cut, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-v", gpui_kit::base::input::Paste, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-z", gpui_kit::base::input::Undo, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-y", gpui_kit::base::input::Redo, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-z", gpui_kit::base::input::Redo, Some("NxNote && MarkdownDocument")),
-        KeyBinding::new("ctrl-f", gpui_kit::base::input::Search, Some("NxNote && MarkdownDocument")),
+        KeyBinding::new("alt-up", MoveLineUp, Some("MarkdownDocument")),
+        KeyBinding::new("alt-down", MoveLineDown, Some("MarkdownDocument")),
+        KeyBinding::new("alt-shift-up", CopyLineUp, Some("MarkdownDocument")),
+        KeyBinding::new("alt-shift-down", CopyLineDown, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-k", DeleteLines, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-a", edit::SelectAll, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-c", edit::Copy, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-x", edit::Cut, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-v", edit::Paste, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-z", edit::Undo, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-y", edit::Redo, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-shift-z", edit::Redo, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-f", edit::Search, Some("MarkdownDocument")),
+        KeyBinding::new("ctrl-\\", ClearFormatting, Some("MarkdownDocument")),
         KeyBinding::new("left", edit::MoveLeft, Some("MarkdownDocument")),
         KeyBinding::new("right", edit::MoveRight, Some("MarkdownDocument")),
         KeyBinding::new("up", edit::MoveUp, Some("MarkdownDocument")),
@@ -137,6 +149,7 @@ pub struct NxNoteApp {
     editor: Entity<crate::note_editor::NoteEditor>,
     editor_events: Subscription,
     editor_observer: Subscription,
+    editor_link_events: Subscription,
     save_task: Option<Task<()>>,
     _events: Task<()>,
     _tray: Option<crate::tray::TrayHandle>,
@@ -148,6 +161,7 @@ pub struct NxNoteApp {
     status: String,
     focus: FocusHandle,
     replacing: bool,
+    tab_drop: Option<(OpenTab, bool)>,
 }
 
 impl NxNoteApp {
@@ -159,6 +173,8 @@ impl NxNoteApp {
     ) -> Self {
         let editor = Self::make_editor(&session.text, window, cx);
         let (editor_events, editor_observer) = Self::watch_editor(&editor, window, cx);
+        editor.update(cx, |state, cx| state.set_note_context(crate::note_links::NoteLinkContext::from_session(&session), cx));
+        let editor_link_events = Self::watch_note_links(&editor, window, cx);
         let hwnd = match HasWindowHandle::window_handle(window) {
             Ok(handle) => match handle.as_raw() {
                 RawWindowHandle::Win32(h) => h.hwnd.get(),
@@ -236,6 +252,7 @@ impl NxNoteApp {
             editor,
             editor_events,
             editor_observer,
+            editor_link_events,
             save_task: None,
             _events: events,
             _tray: tray,
@@ -247,6 +264,7 @@ impl NxNoteApp {
             status,
             focus: cx.focus_handle(),
             replacing: false,
+            tab_drop: None,
         };
         // Never leave an unreachable hidden process when both recovery mechanisms failed.
         if hidden && app._tray.is_none() && app.hotkey.is_none() {
@@ -292,10 +310,22 @@ impl NxNoteApp {
         (events, observer)
     }
 
+    fn watch_note_links(editor: &Entity<crate::note_editor::NoteEditor>, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe_in(editor, window, |app, editor, event: &crate::note_editor::OpenNoteLink, window, cx| {
+            app.session.edit(editor.read(cx).value().to_string());
+            let target = &event.0;
+            app.switch(OpenTab { folder_key: target.note.folder_key.clone(), note_name: target.note.note_name.clone() }, window, cx);
+            if app.session.current.folder_key == target.note.folder_key && app.session.current.note_name == target.note.note_name {
+                if let Some(heading) = &target.heading { app.editor.update(cx, |editor, cx| editor.jump_to_heading(heading, window, cx)); }
+            }
+        })
+    }
     fn reload_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_task = None;
         self.editor = Self::make_editor(&self.session.text, window, cx);
         (self.editor_events, self.editor_observer) = Self::watch_editor(&self.editor, window, cx);
+        self.editor.update(cx, |state, cx| state.set_note_context(crate::note_links::NoteLinkContext::from_session(&self.session), cx));
+        self.editor_link_events = Self::watch_note_links(&self.editor, window, cx);
         if !self.hidden {
             self.editor.update(cx, |state, cx| state.focus(window, cx));
         }
@@ -464,8 +494,21 @@ impl NxNoteApp {
                 self.status = "已保存".into();
                 cx.notify();
             }
-            Ok(false) => {}
+            Ok(false) => {
+                let editor = self.editor.clone();
+                window.on_next_frame(move |window, cx| {
+                    editor.update(cx, |editor, cx| editor.focus(window, cx));
+                });
+            }
             Err(e) => self.error(e, window, cx),
+        }
+    }
+
+    fn drop_tab(&mut self, drag: &DragNoteTab, target: &OpenTab, window: &mut Window, cx: &mut Context<Self>) {
+        let after = self.tab_drop.take().filter(|(tab, _)| tab == target).is_some_and(|(_, after)| after);
+        match self.session.reorder_tab(&drag.tab, target, after) {
+            Ok(_) => { self.editor.update(cx, |editor, cx| editor.focus(window, cx)); cx.notify(); }
+            Err(error) => self.error(format!("标签顺序保存失败: {error:#}"), window, cx),
         }
     }
 
@@ -834,7 +877,7 @@ impl NxNoteApp {
 
 
     fn zoom(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
-        self.session.cfg.font_size = (self.session.cfg.font_size + delta).clamp(10., 24.);
+        self.session.cfg.font_size = (self.session.cfg.font_size.round() + delta).clamp(10., 24.);
         theme::apply(&self.session.cfg, Some(window), cx);
         if let Err(e) = self.session.cfg.save() {
             self.error(e, window, cx);
@@ -845,6 +888,8 @@ impl NxNoteApp {
 
 impl Render for NxNoteApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui_size = cx.theme().font_size;
+        _window.set_rem_size(ui_size);
         let style = theme::document_style(&self.session.cfg, cx);
         self.editor.update(cx, |editor, _| editor.set_style(style));
         let label = format!(
@@ -853,7 +898,7 @@ impl Render for NxNoteApp {
             self.session.label(&self.session.current)
         );
         let toolbar = Toolbar::new("note-toolbar")
-            .xsmall()
+            .small()
             .child(
                 Button::new("pin")
                     .icon(IconName::FileText)
@@ -867,7 +912,8 @@ impl Render for NxNoteApp {
             .content(
                 Button::new("note-menu")
                     .ghost()
-                    .xsmall()
+                    .small()
+                    .text_size(ui_size)
                     .label(label)
                     .tooltip("笔记操作")
                     .dropdown_menu(move |menu, _, _| {
@@ -892,23 +938,39 @@ impl Render for NxNoteApp {
                     .on_click(cx.listener(|app, _, window, cx| app.open_settings(window, cx))),
             );
         let tabs = TabBar::new("note-tabs")
-            .small()
+            .large()
             .selected_index(self.session.active_tab)
             .menu(true)
             .max_width(px(150.))
             .on_click(cx.listener(|app, index, window, cx| app.activate_tab(*index, window, cx)))
             .children(self.session.tabs.iter().enumerate().map(|(index, tab)| {
-                Tab::new().label(self.session.label(tab)).suffix(
-                    Button::new(("close-tab", index))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
+                let target = tab.clone();
+                let move_target = target.clone();
+                let drag = DragNoteTab { tab: tab.clone(), label: self.session.label(tab).into() };
+                let drop_after = self.tab_drop.as_ref().filter(|(candidate, _)| candidate == tab).is_some_and(|(_, after)| *after);
+                let drag_owner = cx.weak_entity();
+                Tab::new().label(self.session.label(tab)).text_size(ui_size)
+                    .on_drag(drag, move |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(owner) = drag_owner.upgrade() { owner.update(cx, |app, _| app.tab_drop = None); }
+                        cx.new(|_| drag.clone())
+                    })
+                    .on_drag_move(cx.listener(move |app, event: &DragMoveEvent<DragNoteTab>, _, cx| {
+                        let after = event.event.position.x > event.bounds.left() + event.bounds.size.width / 2.;
+                        let next = (move_target.clone(), after);
+                        if app.tab_drop.as_ref() != Some(&next) { app.tab_drop = Some(next); cx.notify(); }
+                    }))
+                    .drag_over::<DragNoteTab>(move |style, _, _, cx| {
+                        let style = style.border_color(cx.theme().primary);
+                        if drop_after { style.border_r_2().border_l_0() } else { style.border_l_2().border_r_0() }
+                    })
+                    .on_drop(cx.listener(move |app, drag: &DragNoteTab, window, cx| app.drop_tab(drag, &target, window, cx)))
+                    .suffix(Button::new(("close-tab", index)).ghost().xsmall().icon(IconName::Close)
                         .tooltip("关闭标签")
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
                         .on_click(cx.listener(move |app, _, window, cx| {
-                            cx.stop_propagation();
-                            app.close_tab(index, window, cx);
-                        })),
-                )
+                            cx.stop_propagation(); app.close_tab(index, window, cx);
+                        })))
             }));
         let body = div()
             .flex_1()
@@ -916,7 +978,7 @@ impl Render for NxNoteApp {
             .child(self.editor.clone());
         let cursor = self.editor.read(cx).cursor_position();
         let status = StatusBar::new()
-            .text_xs()
+            .text_size(ui_size)
             .left(self.status.clone())
             .right(format!(
                 "{} 字 · {}:{}",
@@ -1005,7 +1067,7 @@ impl Render for NxNoteApp {
                         cx.notify();
                     }))
                     .when(title_visible, |header| {
-                        header.child(TitleBar::new().child("NxNote").on_close_window(
+                        header.child(TitleBar::new().text_size(ui_size).child("NxNote").on_close_window(
                             cx.listener(|app, _, window, cx| app.request_close(window, cx)),
                         ))
                     })

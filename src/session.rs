@@ -105,6 +105,23 @@ impl Session {
         Ok(true)
     }
 
+    /// Reorder by note identity. Persist config first; never reload/edit the current document.
+    pub fn reorder_tab(&mut self, source: &OpenTab, target: &OpenTab, after: bool) -> Result<bool> {
+        if source == target { return Ok(false); }
+        let Some(from) = self.tabs.iter().position(|tab| tab == source) else { return Ok(false); };
+        let mut next = self.tabs.clone();
+        let moved = next.remove(from);
+        let Some(target_index) = next.iter().position(|tab| tab == target) else { return Ok(false); };
+        next.insert(target_index + usize::from(after), moved);
+        if next == self.tabs { return Ok(false); }
+        let active = next.iter().position(|tab| tab == &self.current).unwrap_or(0);
+        let mut cfg = self.cfg.clone();
+        cfg.open_tabs = next.clone(); cfg.active_tab = active;
+        cfg.save()?;
+        self.tabs = next; self.active_tab = active; self.cfg = cfg;
+        Ok(true)
+    }
+
     pub fn close_tab(&mut self, index: usize) -> Result<bool> {
         if index >= self.tabs.len() {
             return Ok(false);

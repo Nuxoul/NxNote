@@ -26,9 +26,9 @@ pub fn apply(cfg: &Config, window: Option<&mut Window>, cx: &mut App) {
         .map(|p| crate::fonts::font_display_name(std::path::Path::new(p)));
     Theme::update(cx, |theme| {
         theme.font_family = ui.unwrap_or_else(|| "Microsoft YaHei UI".into()).into();
-        theme.font_size = px(13.);
+        theme.font_size = px(cfg.ui_font_size.clamp(10, 24) as f32);
         theme.mono_font_family = editor.unwrap_or_else(|| "Consolas".into()).into();
-        theme.mono_font_size = px(cfg.font_size.clamp(10., 24.));
+        theme.mono_font_size = px(cfg.font_size.round().clamp(10., 24.));
         let colors = if theme.is_dark() {
             &cfg.md_dark
         } else {
@@ -59,6 +59,18 @@ pub fn color([r, g, b]: [u8; 3]) -> gpui_kit::Hsla {
     gpui_kit::rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
 }
 
+/// Same body-relative heading scales and line heights as Kit Markdown.
+pub fn markdown_metrics(level: u8) -> (f32, f32) {
+    match level {
+        1 => (1.8, 1.25),
+        2 => (4. / 3., 1.35),
+        3 => (17. / 15., 1.35),
+        4 => (1., 1.35),
+        5 => (14. / 15., 1.35),
+        6 => (13. / 15., 1.35),
+        _ => (1., 1.5),
+    }
+}
 pub fn document_style(cfg: &Config, cx: &App) -> gpui_kit::base::TextViewStyle {
     use gpui_kit::component::ActiveTheme;
     use gpui_kit::{HighlightStyle, StyleRefinement, Styled};
@@ -68,13 +80,17 @@ pub fn document_style(cfg: &Config, cx: &App) -> gpui_kit::base::TextViewStyle {
         &cfg.md_light
     };
     let heading = color(colors.heading);
+    let body_size = cfg.font_size.round().clamp(10., 24.);
     gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
         .with_foreground(color(colors.text))
         .with_muted_foreground(color(colors.quote_text))
         .with_link(color(colors.link))
         .with_border(color(colors.quote_bar))
         .with_code_background(color(colors.code_bg))
-        .with_heading(move |_| StyleRefinement::default().text_color(heading))
+        .with_heading(move |level| StyleRefinement::default()
+            .text_color(heading)
+            .text_size(px(body_size * markdown_metrics(level).0))
+            .font_weight(gpui_kit::FontWeight::SEMIBOLD))
         .with_inline_code(HighlightStyle {
             color: Some(color(colors.code_text)),
             background_color: Some(color(colors.code_bg)),

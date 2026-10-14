@@ -68,6 +68,7 @@ pub struct SettingsView {
     draft: Config,
     tab: usize,
     font_size: Entity<InputState>,
+    ui_font_size: Entity<InputState>,
     window_width: Entity<InputState>,
     window_height: Entity<InputState>,
     autosave_delay: Entity<InputState>,
@@ -119,7 +120,8 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let font_size = number_state(draft.font_size as f64, 10., 24., 0.5, window, cx);
+        let font_size = integer_font_state(draft.font_size.round(), window, cx);
+        let ui_font_size = integer_font_state(draft.ui_font_size as f32, window, cx);
         let window_width = number_state(draft.window_width as f64, 220., 1600., 1., window, cx);
         let window_height = number_state(draft.window_height as f64, 200., 1600., 1., window, cx);
         let autosave_delay = number_state(
@@ -148,6 +150,7 @@ impl SettingsView {
         let mut subscriptions = Vec::new();
         for state in [
             &font_size,
+            &ui_font_size,
             &window_width,
             &window_height,
             &autosave_delay,
@@ -225,6 +228,7 @@ impl SettingsView {
             draft,
             tab: 0,
             font_size,
+            ui_font_size,
             window_width,
             window_height,
             autosave_delay,
@@ -272,7 +276,8 @@ impl SettingsView {
     }
 
     fn collected_config(&self, cx: &App) -> anyhow::Result<Config> {
-        let font_size = read_number(&self.font_size, "字号", 10., 24., cx)? as f32;
+        let font_size = read_font_size(&self.font_size, "正文字号", cx)?;
+        let ui_font_size = read_font_size(&self.ui_font_size, "界面字号", cx)? as u16;
         let window_width = read_number(&self.window_width, "默认宽度", 220., 1600., cx)? as f32;
         let window_height = read_number(&self.window_height, "默认高度", 200., 1600., cx)? as f32;
         let autosave_delay_ms =
@@ -306,6 +311,7 @@ impl SettingsView {
 
         let mut config = self.draft.clone();
         config.font_size = font_size;
+        config.ui_font_size = ui_font_size;
         config.window_width = window_width;
         config.window_height = window_height;
         config.autosave_delay_ms = autosave_delay_ms;
@@ -352,8 +358,14 @@ impl SettingsView {
             )
             .child(
                 Field::new()
-                    .label("字号")
-                    .description("正文显示字号，10–24 px")
+                    .label("界面字号")
+                    .description("标题、菜单、标签和设置，整数 10–24 px")
+                    .child(NumberInput::new(&self.ui_font_size).suffix("px")),
+            )
+            .child(
+                Field::new()
+                    .label("正文字号")
+                    .description("笔记正文及 Markdown 排版基准，整数 10–24 px")
                     .child(NumberInput::new(&self.font_size).suffix("px")),
             )
             .child(
@@ -505,7 +517,8 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(cx.theme().font_size);
         let content = match self.tab {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_behavior(cx).into_any_element(),
@@ -519,6 +532,8 @@ impl Render for SettingsView {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .font_family(cx.theme().font_family.clone())
+            .text_size(cx.theme().font_size)
             .child(TitleBar::new().child("NxNote 设置"))
             .child(
                 div().px_6().pt_5().pb_3().child(
@@ -583,6 +598,19 @@ impl Render for SettingsView {
     }
 }
 
+fn integer_font_state(value: f32, window: &mut Window, cx: &mut Context<SettingsView>) -> Entity<InputState> {
+    cx.new(|cx| InputState::new(window, cx)
+        .default_value(format!("{:.0}", value.round().clamp(10., 24.)))
+        .step(1.).min(10.).max(24.)
+        .mask_pattern(gpui_kit::base::input::MaskPattern::Number { separator: None, fraction: Some(0) })
+        .validate(|text, _| text.is_empty() || text.bytes().all(|b| b.is_ascii_digit())))
+}
+fn read_font_size(state: &Entity<InputState>, label: &str, cx: &App) -> anyhow::Result<f32> {
+    let value = state.read(cx).value().trim().parse::<u16>()
+        .map_err(|_| anyhow!("{label}必须是整数"))?;
+    if !(10..=24).contains(&value) { return Err(anyhow!("{label}必须在 10–24 之间")); }
+    Ok(value as f32)
+}
 fn number_state(
     value: f64,
     min: f64,

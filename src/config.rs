@@ -96,7 +96,11 @@ pub struct Config {
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
     pub always_on_top: bool,
+    /// Keep the legacy field name for body text; old fractional values are rounded on load.
+    #[serde(serialize_with = "serialize_body_font_size")]
     pub font_size: f32,
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: u16,
     pub hotkey: String,
     /// 剪贴板快速捕获热键：按下后把剪贴板文本追加进速记本
     #[serde(default = "default_hotkey_capture")]
@@ -133,6 +137,10 @@ pub struct Config {
     pub active_tab: usize,
 }
 
+fn default_ui_font_size() -> u16 { 16 }
+fn serialize_body_font_size<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u16(value.round().clamp(10., 24.) as u16)
+}
 fn default_close_to_tray() -> bool {
     true
 }
@@ -154,6 +162,7 @@ impl Default for Config {
             window_pos: None,
             always_on_top: false,
             font_size: 13.0,
+            ui_font_size: default_ui_font_size(),
             hotkey: "Ctrl+Alt+N".to_string(),
             hotkey_capture: default_hotkey_capture(),
             autosave_delay_ms: 1500,
@@ -177,7 +186,12 @@ impl Config {
     pub fn load() -> Self {
         let p = config_path();
         match std::fs::read_to_string(&p) {
-            Ok(s) => toml::from_str(&s).unwrap_or_default(),
+            Ok(s) => {
+                let mut cfg: Self = toml::from_str(&s).unwrap_or_default();
+                cfg.font_size = if cfg.font_size.is_finite() { cfg.font_size.round().clamp(10., 24.) } else { 13. };
+                cfg.ui_font_size = cfg.ui_font_size.clamp(10, 24);
+                cfg
+            }
             Err(_) => {
                 let c = Self::default();
                 let _ = c.save();

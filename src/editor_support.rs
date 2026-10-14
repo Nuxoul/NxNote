@@ -1,52 +1,5 @@
-//! Markdown editing rules layered over the Kit editor, without a second text engine.
+//! UI-independent line actions and image URL classification.
 use std::ops::Range;
-
-pub fn continuation_edit(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
-    if cursor == 0
-        || cursor > text.len()
-        || !text.is_char_boundary(cursor)
-        || text.as_bytes()[cursor - 1] != b'\n'
-    {
-        return None;
-    }
-    let end = cursor - 1;
-    let start = text[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line = &text[start..end];
-    // Don't continue a list inside a fenced code block.
-    let fences = text[..start]
-        .lines()
-        .filter(|l| l.trim_start().starts_with("```") || l.trim_start().starts_with("~~~"))
-        .count();
-    if fences % 2 != 0 {
-        return None;
-    }
-    let trimmed = line.trim_start_matches([' ', '\t']);
-    let indent = &line[..line.len() - trimmed.len()];
-    let (marker, content) = if let Some(rest) = trimmed
-        .strip_prefix("- [ ] ")
-        .or_else(|| trimmed.strip_prefix("- [x] "))
-        .or_else(|| trimmed.strip_prefix("- [X] "))
-    {
-        ("- [ ] ".to_string(), rest)
-    } else if trimmed.len() >= 2
-        && matches!(trimmed.as_bytes()[0], b'-' | b'*' | b'+')
-        && trimmed.as_bytes()[1] == b' '
-    {
-        (trimmed[..2].to_string(), &trimmed[2..])
-    } else {
-        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 || !trimmed[digits..].starts_with(". ") {
-            return None;
-        }
-        let number = trimmed[..digits].parse::<u64>().ok()?.checked_add(1)?;
-        (format!("{number}. "), &trimmed[digits + 2..])
-    };
-    if content.trim().is_empty() {
-        Some((start..cursor, indent.to_string()))
-    } else {
-        Some((cursor..cursor, format!("{indent}{marker}")))
-    }
-}
 
 pub fn image_url(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
@@ -64,31 +17,6 @@ pub fn image_url(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn unicode_list_continues() {
-        let text = "- 中文🙂\n";
-        assert_eq!(
-            continuation_edit(text, text.len()),
-            Some((text.len()..text.len(), "- ".into()))
-        );
-    }
-    #[test]
-    fn ordered_and_task_lists_continue() {
-        assert_eq!(continuation_edit("9. item\n", 8).unwrap().1, "10. ");
-        assert_eq!(
-            continuation_edit("  - [x] done\n", 13).unwrap().1,
-            "  - [ ] "
-        );
-    }
-    #[test]
-    fn empty_list_exits() {
-        assert_eq!(continuation_edit("- \n", 3), Some((0..3, "".into())));
-    }
-    #[test]
-    fn code_and_non_newline_are_unchanged() {
-        assert!(continuation_edit("```\n- code\n", 11).is_none());
-        assert!(continuation_edit("- 中文", 5).is_none());
-    }
     #[test]
     fn image_urls_handle_query_and_case() {
         assert!(image_url("https://example.com/图片.PNG?size=2"));

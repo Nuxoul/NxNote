@@ -12,10 +12,13 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     ActiveTheme, IconName, Sizable, StyledExt,
 };
-use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::{cell::RefCell, ops::Range, path::PathBuf, rc::Rc, time::{Duration, Instant}};
 use unicode_segmentation::UnicodeSegmentation;
+#[path = "markdown_widgets.rs"]
+mod markdown_widgets;
+pub use markdown_widgets::OpenNoteLink;
+pub(crate) use markdown_widgets::{WidgetView, WidgetViews};
 
 pub struct CursorPosition { pub line: usize, pub character: usize }
 #[derive(Clone)]
@@ -51,6 +54,12 @@ pub struct NoteEditor {
     paste_task: Option<Task<()>>,
     paste_pending: bool,
     revision: u64,
+    widget_views: WidgetViews,
+    widget_task: Option<Task<()>>,
+    widget_generation: u64,
+    note_context: Option<crate::note_links::NoteLinkContext>,
+    metadata_expanded: bool,
+    footnote_return: Option<usize>,
 }
 impl EventEmitter<InputEvent> for NoteEditor {}
 impl Focusable for NoteEditor {
@@ -79,7 +88,7 @@ impl NoteEditor {
         Self {
             focus, search, search_open: false, text: text.to_string().into(), selection: 0..0,
             reversed: false, marked: None, composition_before: None,
-            document: Rc::new(Document::new(text, 0, false, &attachments)),
+            document: Rc::new(Document::new(text, 0, None, &attachments)),
             geometry: Rc::new(RefCell::new(DocumentGeometry::default())), scroll: ScrollHandle::new(),
             style: gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx)),
             undo: Vec::new(), redo: Vec::new(), last_edit: None,
@@ -87,6 +96,8 @@ impl NoteEditor {
             preferred_x: None, reveal_cursor: false, caret_visible: true, blink_task: None,
             attachments, attachment_error, _subscriptions: vec![search_events, focus_event, blur_event],
             paste_task: None, paste_pending: false, revision: 0,
+            widget_views: WidgetViews::default(), widget_task: None, widget_generation: 0,
+            note_context: None, metadata_expanded: false, footnote_return: None,
         }
     }
     pub fn set_style(&mut self, style: gpui_kit::base::TextViewStyle) { self.style = style; }
@@ -104,7 +115,7 @@ impl NoteEditor {
     fn anchor(&self) -> usize { if self.reversed { self.selection.end } else { self.selection.start } }
     fn snapshot(&self) -> Snapshot { Snapshot { text: self.text.clone(), selection: self.selection.clone(), reversed: self.reversed } }
     fn rebuild(&mut self) {
-        self.document = Rc::new(Document::new(&self.text, self.cursor(), self.marked.is_some(), &self.attachments));
+        self.document = Rc::new(Document::with_options(&self.text, self.cursor(), self.marked.clone(), &self.attachments, self.metadata_expanded));
     }
     pub fn set_selected_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let start = boundary(&self.text, range.start);
@@ -124,6 +135,8 @@ impl NoteEditor {
         self.restart_blink(window, cx); cx.notify();
     }
     pub fn set_value(&mut self, text: String, _: &mut Window, cx: &mut Context<Self>) {
+        self.widget_views = WidgetViews::default(); self.widget_task = None; self.widget_generation += 1;
+        self.metadata_expanded = false; self.footnote_return = None;
         self.text = text.into(); self.selection = 0..0; self.reversed = false;
         self.marked = None; self.composition_before = None; self.undo.clear(); self.redo.clear();
         self.last_edit = None; self.preferred_x = None; self.stop_drag(); self.revision += 1;
@@ -160,6 +173,7 @@ impl NoteEditor {
         let end = boundary(&self.text, range.end).max(start);
         let range = self.normalize_image_range(start..end);
         if self.text.get(range.clone()) == Some(value) { return; }
+        let coalesce = coalesce && !value.chars().any(char::is_whitespace);
         let empty_code = range.is_empty() && !value.is_empty() && self.document.rows.iter().any(|row| {
             row.code && row.source.is_empty() && row.source.start == range.start
         }) && self.text[range.start..].trim_start().starts_with(|c: char| c == '`' || c == '~');
@@ -178,6 +192,7 @@ impl NoteEditor {
         let mut text = self.text.to_string(); text.replace_range(range.clone(), value); self.text = text.into();
         let end = range.start + value.len(); self.selection = end..end; self.reversed = false;
         self.preferred_x = None; self.revision += 1;
+        self.widget_views.0.retain(|_, view| !matches!(view, WidgetView::Preview(_)));
     }
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild(); self.reveal_cursor = true; self.restart_blink(window, cx);
@@ -263,79 +278,60 @@ impl NoteEditor {
         let target = geometry.hit(position).unwrap_or(self.cursor());
         drop(geometry); self.select_to(target, false, window, cx);
     }
+    fn apply_format_edit(&mut self, edit: crate::markdown_format::FormatEdit, window: &mut Window, cx: &mut Context<Self>) {
+        self.widget_views.0.retain(|_, view| !matches!(view, WidgetView::Preview(_)));
+        if self.text.as_ref() == edit.text.as_str() && self.selection == edit.selection { return; }
+        self.remember(false, &self.selection.clone());
+        self.text = edit.text.into(); self.selection = edit.selection; self.reversed = false;
+        self.last_edit = None; self.preferred_x = None; self.revision += 1;
+        self.changed(window, cx);
+    }
+    fn clear_formatting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_some() { return; }
+        if let Some(edit) = crate::markdown_format::clear(&self.text, self.selection.clone(), &self.attachments) {
+            self.apply_format_edit(edit, window, cx);
+        }
+    }
     fn delete(&mut self, backwards: bool, word: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_some() { return; }
-        if !self.selection.is_empty() { self.edit(self.selection.clone(), "", false, window, cx); return; }
-        let cursor = self.cursor();
-        if let Some((row, column)) = self.document.cell_at(cursor) {
-            let cell = &self.document.rows[row].cells[column];
-            if (backwards && cursor == cell.source.start) || (!backwards && cursor == cell.source.end) { return; }
-            if word {
-                let target = self.step(backwards, true).clamp(cell.source.start, cell.source.end);
+        let atoms = self.document.images().cloned().collect::<Vec<_>>();
+        // Table cells are bounded editing regions, not paragraph merge targets.
+        if self.selection.is_empty() {
+            if let Some((row, column)) = self.document.cell_at(self.cursor()) {
+                let cell = &self.document.rows[row].cells[column];
+                let cursor = self.cursor();
+                if (backwards && cursor == cell.source.start) || (!backwards && cursor == cell.source.end) { return; }
+                let text = &self.text[cell.source.clone()];
+                let relative = cursor - cell.source.start;
+                let target = if word && backwards {
+                    text[..relative].unicode_word_indices().next_back().map_or(0, |(start, _)| start)
+                } else if word {
+                    text[relative..].unicode_word_indices().next().map_or(text.len(), |(start, word)| relative + start + word.len())
+                } else if backwards {
+                    text[..relative].grapheme_indices(true).next_back().map_or(relative, |(start, _)| start)
+                } else { text[relative..].graphemes(true).next().map_or(relative, |grapheme| relative + grapheme.len()) };
+                let target = cell.source.start + target;
                 self.edit(cursor.min(target)..cursor.max(target), "", false, window, cx); return;
             }
         }
-        if let Some(row) = self.document.rows.iter().find(|row| row.code && cursor >= row.source.start && cursor <= row.source.end) {
-            let edge = if backwards { row.source.start } else { row.source.end };
-            if cursor == edge {
-                let adjacent = if backwards { self.text[..cursor].chars().next_back() } else { self.text[cursor..].chars().next() };
-                if adjacent != Some('\n') && adjacent != Some('\r') { return; }
-                let target = if backwards { cursor.saturating_sub(1) } else { (cursor + 1).min(self.text.len()) };
-                let other_code = self.document.rows.iter().any(|candidate| candidate.code && (candidate.source.start == target || candidate.source.end == target));
-                if !other_code { self.select_to(self.step(backwards, false), false, window, cx); return; }
-                self.edit(cursor.min(target)..cursor.max(target), "", false, window, cx); return;
-            }
+        if let Some(edit) = crate::markdown_edit::delete(&self.text, self.selection.clone(), backwards, word, &self.attachments, &atoms) {
+            self.apply_format_edit(edit, window, cx);
         }
-        let target = self.step(backwards, word);
-        if target == cursor { return; }
-        let range = cursor.min(target)..cursor.max(target);
-        // At a reading block's start, remove its structural prefix first, then join
-        // paragraphs on the next Backspace; do not eat the last glyph of the prior block.
-        if backwards && self.document.rows.iter().any(|row| row.cells.iter().any(|cell| cell.source.start == cursor)) {
-            let line_start = self.text[..cursor].rfind('\n').map_or(0, |i| i + 1);
-            let prefix = &self.text[line_start..cursor];
-            if !prefix.is_empty() && (prefix.trim_start().starts_with('#') || prefix.trim_start().starts_with('>')
-                || prefix.trim_start().starts_with(|c: char| matches!(c, '-' | '*' | '+')) || prefix.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit())) {
-                self.edit(line_start..cursor, "", false, window, cx); return;
-            }
-            if line_start == cursor && cursor > 0 {
-                self.edit(cursor - 1..cursor, "", false, window, cx); return;
-            }
-        }
-        if !backwards && self.text[cursor..].starts_with('\n') {
-            self.edit(cursor..cursor + 1, "", false, window, cx); return;
-        }
-        let mapped = if word { None } else { self.geometry.borrow().deletion_range(cursor, backwards) };
-        self.edit(mapped.unwrap_or(range), "", false, window, cx);
     }
     fn enter(&mut self, shift: bool, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_some() { return; }
-        let cursor = self.cursor();
-        if self.document.cell_at(cursor).is_some() && !shift {
+        if self.selection.is_empty() && self.document.cell_at(self.cursor()).is_some() && !shift {
             self.table_move(1, true, window, cx); return;
         }
-        let code = self.document.code_at(cursor);
-        let line_start = self.text[..cursor].rfind('\n').map_or(0, |i| i + 1);
-        let line = self.text[line_start..cursor].to_string();
-        let indent = if code { line.chars().take_while(|c| *c == ' ' || *c == '\t').collect::<String>() } else { String::new() };
-        self.remember(false, &self.selection.clone());
-        let replacement = if self.document.cell_at(cursor).is_some() { "<br>".to_string() }
-            else if shift && !code { "  \n".to_string() } else { format!("\n{indent}") };
-        self.apply(self.selection.clone(), &replacement);
-        if !shift && !code {
-            if let Some((range, replacement)) = crate::editor_support::continuation_edit(&self.text, self.cursor()) {
-                self.apply(range, &replacement);
-            } else {
-                let quote = line.trim_start();
-                if quote.starts_with('>') {
-                    let prefix = quote.chars().take_while(|c| *c == '>' || *c == ' ').collect::<String>();
-                    if quote[prefix.len()..].trim().is_empty() {
-                        let end = self.cursor(); self.apply(line_start..end, "");
-                    } else { let cursor = self.cursor(); self.apply(cursor..cursor, &prefix); }
-                }
-            }
+        if self.document.cell_at(self.cursor()).is_some() && shift {
+            self.edit(self.selection.clone(), "<br>", false, window, cx);
+            cx.emit(InputEvent::PressEnter { secondary, shift }); return;
         }
-        self.changed(window, cx); cx.emit(InputEvent::PressEnter { secondary, shift });
+        let selection = self.normalize_image_range(self.selection.clone());
+        if let Some(edit) = crate::markdown_edit::newline(&self.text, selection, shift, &self.attachments) {
+            self.apply_format_edit(edit, window, cx);
+            cx.emit(InputEvent::PressEnter { secondary, shift });
+        }
     }
     fn table_move(&mut self, direction: i32, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some((row_index, column)) = self.document.cell_at(self.cursor()) else { return; };
@@ -398,6 +394,11 @@ impl NoteEditor {
         self.commit_composition(); self.focus.focus(window, cx);
         let hit = { self.geometry.borrow().hit(event.position) };
         let Some(offset) = hit else { return; };
+        if event.modifiers.control {
+            if let Some(target) = self.document.links.iter().find(|link| offset >= link.source.start && offset <= link.source.end).map(|link| link.target.clone()) {
+                self.open_target(target, window, cx); return;
+            }
+        }
         self.selecting = true; self.pointer = Some(event.position); self.preferred_x = None;
         self.drag_anchor = if event.modifiers.shift { self.anchor() } else { offset };
         if event.click_count >= 3 {
@@ -456,6 +457,12 @@ impl NoteEditor {
     pub(crate) fn toggle_task(&mut self, range: Range<usize>, checked: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.edit(range, if checked { " " } else { "x" }, false, window, cx); self.focus.focus(window, cx);
     }
+    fn paste_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_composition();
+        let item = cx.read_from_clipboard().unwrap_or(ClipboardItem { entries: Vec::new() });
+        self.paste_item(item, window, cx);
+        self.focus.focus(window, cx);
+    }
     fn paste_item(&mut self, mut item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
         let files: Vec<PathBuf> = crate::platform::clipboard_files().into_iter().filter(|path| is_image_file(path)).collect();
         if !files.is_empty() { item.entries.push(ClipboardEntry::ExternalPaths(ExternalPaths(files.into()))); }
@@ -466,11 +473,11 @@ impl NoteEditor {
         else if let Some(text) = item.text() {
             if crate::editor_support::image_url(&text) { self.replace(format!("![图片]({})", text.trim()), window, cx); }
             else {
-                let text = if self.document.cell_at(self.cursor()).is_some() {
-                    text.replace('|', "\\|").replace('\n', "<br>")
-                } else { text };
+                let text = input_text(&text, self.document.cell_at(self.cursor()).is_some());
                 self.replace(text, window, cx);
             }
+        } else {
+            self.report("剪贴板中没有可读取的文字或图片，请重新复制后粘贴".into(), window, cx);
         }
     }
     fn paste_images(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
@@ -520,13 +527,27 @@ impl NoteEditor {
         window.push_notification(Notification::new().message(message).with_type(NotificationType::Error), cx);
     }
     fn utf16(&self, byte: usize) -> usize { self.text[..boundary(&self.text, byte)].encode_utf16().count() }
-    fn utf8(&self, units: usize) -> usize { byte_for_utf16(&self.text, units) }
     fn from_utf16(&self, range: Range<usize>) -> Range<usize> {
-        let start = self.utf8(range.start); let end = self.utf8(range.end).max(start); start..end
+        let start = byte_for_utf16(&self.text, range.start, false);
+        let end = if range.is_empty() { start } else { byte_for_utf16(&self.text, range.end, true).max(start) };
+        start..end
     }
     fn to_utf16(&self, range: Range<usize>) -> Range<usize> { self.utf16(range.start)..self.utf16(range.end) }
 }
 impl EntityInputHandler for NoteEditor {
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_composition();
+        self.paste_item(item, window, cx);
+        self.focus.focus(window, cx);
+    }
+    fn set_selected_text_range(&mut self, range_utf16: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let range = self.from_utf16(range_utf16);
+        self.set_selected_range(self.normalize_image_range(range), cx);
+        self.restart_blink(window, cx);
+    }
+    fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        Some(self.text.encode_utf16().count())
+    }
     fn text_for_range(&mut self, range: Range<usize>, adjusted: &mut Option<Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
         let range = self.from_utf16(range); *adjusted = Some(self.to_utf16(range.clone())); Some(self.text[range].to_string())
     }
@@ -542,63 +563,79 @@ impl EntityInputHandler for NoteEditor {
     }
     fn replace_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let range = range.map(|r| self.from_utf16(r)).or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
-        let value = if self.document.cell_at(range.start).is_some() {
-            text.replace('|', "\\|").replace('\n', "<br>")
-        } else { text.to_string() };
+        let range = self.normalize_image_range(range);
+        let value = input_text(text, self.document.cell_at(range.start).is_some());
         if self.composition_before.is_some() {
             self.apply(range, &value); self.commit_composition(); self.changed(window, cx);
         } else { self.edit(range, &value, !text.contains('\n'), window, cx); }
     }
-    fn replace_and_mark_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>, window: &mut Window, cx: &mut Context<Self>) {
-        let range = range.map(|r| self.from_utf16(r)).or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
+    fn replace_and_mark_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>, _window: &mut Window, cx: &mut Context<Self>) {
+        let range = range.map(|range| self.from_utf16(range)).or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
+        let range = self.normalize_image_range(range);
+        let table = self.document.cell_at(range.start).is_some();
+        let value = input_text(text, table);
         if self.composition_before.is_none() { self.composition_before = Some(self.snapshot()); }
-        let empty_code = range.is_empty() && !text.is_empty() && self.document.rows.iter().any(|row| {
+        let empty_code = range.is_empty() && !value.is_empty() && self.document.rows.iter().any(|row| {
             row.code && row.source.is_empty() && row.source.start == range.start
         }) && self.text[range.start..].trim_start().starts_with(|c: char| c == '`' || c == '~');
         let start = range.start;
-        if empty_code { self.apply(range, &format!("{text}\n")); }
-        else { self.apply(range, text); }
-        let end = start + text.len(); self.selection = end..end;
-        self.marked = (!text.is_empty()).then_some(start..end);
+        if empty_code { self.apply(range, &format!("{value}\n")); }
+        else { self.apply(range, &value); }
+        let end = start + value.len();
+        self.selection = end..end; self.reversed = false;
+        self.marked = (!value.is_empty()).then_some(start..end);
         if let Some(selected) = selected {
-            let a = start + byte_for_utf16(text, selected.start); let b = start + byte_for_utf16(text, selected.end);
-            self.selection = a..b.max(a); self.reversed = false;
+            let first = byte_for_utf16(text, selected.start, false);
+            let last = if selected.is_empty() { first } else { byte_for_utf16(text, selected.end, true).max(first) };
+            let a = start + input_text(&text[..first], table).len();
+            let b = start + input_text(&text[..last], table).len();
+            self.selection = a..b.max(a);
+        }
+        if value.is_empty() {
+            let changed = self.composition_before.as_ref().is_some_and(|before| before.text != self.text);
+            self.commit_composition();
+            if changed { cx.emit(InputEvent::Change); }
         }
         self.rebuild(); self.reveal_cursor = true; self.caret_visible = true; cx.notify();
     }
     fn bounds_for_range(&mut self, range: Range<usize>, _: Bounds<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
         let range = self.from_utf16(range);
-        let geometry = self.geometry.borrow();
-        let start = geometry.caret(range.start)?; let end = geometry.caret(range.end).unwrap_or(start);
-        let right = if end.position.y == start.position.y { end.position.x.max(start.position.x + px(1.)) } else { start.position.x + px(1.) };
-        Some(Bounds::from_corners(start.position, point(right, start.position.y + start.height)))
+        self.geometry.borrow().input_bounds(range)
     }
     fn character_index_for_point(&mut self, position: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        if !self.scroll.bounds().contains(&position) { return None; }
         self.geometry.borrow().hit(position).map(|offset| self.utf16(offset))
     }
 }
 impl Render for NoteEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_widget_assets(window, cx);
         let focused = self.focus.is_focused(window);
         let caret_visible = self.caret_visible || self.marked.is_some();
         let cursor = self.cursor();
+        let line_starts: Vec<usize> = std::iter::once(0).chain(self.text.match_indices('\n').map(|(offset, _)| offset + 1)).collect();
+        let gutter_width = px((line_starts.len().to_string().len() as f32 * 8. + 20.).max(44.));
         let geometry = self.geometry.clone();
         let font = font(cx.theme().mono_font_family.clone()); let font_size = cx.theme().mono_font_size;
         let rows = self.document.rows.iter().cloned().enumerate().map(|(index, row)| DocumentRow {
             editor: cx.entity(), row, index, geometry: geometry.clone(), style: self.style.clone(),
             selection: self.selection.clone(), cursor, marked: self.marked.clone(), focused, caret_visible,
-            font: font.clone(), font_size,
+            font: font.clone(), font_size, gutter_width,
+            widgets: self.widget_views.clone(),
         }).collect::<Vec<_>>();
         let clear = geometry.clone();
         let scroll = self.scroll.clone();
         let reveal = self.reveal_cursor; self.reveal_cursor = false;
+        let gutter_font = font.clone();
+        let gutter_color = cx.theme().muted_foreground;
         let input = cx.entity(); let focus = self.focus.clone();
         let document = div().id("markdown-document").key_context("MarkdownDocument").track_focus(&self.focus)
             .v_flex().size_full().min_h_0().cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(|this, _: &crate::app::ClearFormatting, window, cx| this.clear_formatting(window, cx)))
             .on_action(cx.listener(|this, _: &input_action::SelectAll, window, cx| { this.selection = 0..this.text.len(); this.reversed = false; this.rebuild(); this.restart_blink(window, cx); cx.notify(); }))
             .on_action(cx.listener(|this, _: &input_action::Copy, _, cx| this.copy(cx)))
             .on_action(cx.listener(|this, _: &input_action::Cut, window, cx| this.cut(window, cx)))
-            .on_action(cx.listener(|this, _: &input_action::Paste, window, cx| { if let Some(item) = cx.read_from_clipboard() { this.paste_item(item, window, cx); } }))
+            .on_action(cx.listener(|this, _: &input_action::Paste, window, cx| this.paste_from_clipboard(window, cx)))
             .on_action(cx.listener(|this, _: &input_action::Undo, window, cx| this.history(false, window, cx)))
             .on_action(cx.listener(|this, _: &input_action::Redo, window, cx| this.history(true, window, cx)))
             .on_action(cx.listener(|this, _: &input_action::Backspace, window, cx| this.delete(true, false, window, cx)))
@@ -638,11 +675,28 @@ impl Render for NoteEditor {
             .child(div().id("document-scroll").relative().v_flex().flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).px_3().py_2()
                 .child(canvas(move |_, _, _| { clear.borrow_mut().clear(); }, |_, _, _, _| {}).h(px(0.)).w_full())
                 .children(rows)
-                .child(div().id("document-end").h(px(80.)).w_full().on_click(cx.listener(|this, _, window, cx| {
-                    let end = this.text.len(); this.select_to(end, false, window, cx);
-                })))
+                .child(div().id("document-end").h(px(80.)).w_full())
                 .child(canvas(|_, _, _| {}, move |bounds, _, window, cx| {
                     window.handle_input(&focus, ElementInputHandler::new(bounds, input.clone()), cx);
+                    let viewport = scroll.bounds();
+                    window.with_content_mask(Some(ContentMask { bounds: viewport }), |window| {
+                    let mut painted_y: Vec<Pixels> = Vec::new();
+                    for (line_index, source) in line_starts.iter().copied().enumerate() {
+                        if let Some(caret) = geometry.borrow().caret(source) {
+                            if caret.position.y + caret.height < viewport.top() || caret.position.y > viewport.bottom() { continue; }
+                            if painted_y.iter().any(|y| (*y - caret.position.y).abs() < px(1.)) { continue; }
+                            painted_y.push(caret.position.y);
+                            let label = (line_index + 1).to_string();
+                            let run = TextRun { len: label.len(), font: gutter_font.clone(), color: gutter_color,
+                                background_color: None, underline: None, strikethrough: None };
+                            let shaped = window.text_system().shape_line(label.into(), px(13.), &[run], None);
+                            let x = viewport.left() + px(12.) + gutter_width - px(10.) - shaped.width();
+                            let _ = shaped.paint(point(x, caret.position.y), caret.height, TextAlign::Left, None, window, cx);
+                        }
+                    }
+                    window.paint_quad(fill(Bounds::new(point(viewport.left() + px(12.) + gutter_width, viewport.top()),
+                        size(px(1.), viewport.size.height)), gutter_color.opacity(0.25)));
+                    });
                     let move_input = input.clone();
                     window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble {
@@ -676,14 +730,25 @@ impl Render for NoteEditor {
             .on_action(cx.listener(|this, _: &input_action::Search, window, cx| {
                 this.search_open = true; this.search.focus_handle(cx).focus(window, cx); cx.notify();
             }))
+            .children(self.footnote_return.map(|_| Button::new("footnote-return").ghost().xsmall().label("返回脚注引用")
+                .on_click(cx.listener(|this, _, window, cx| this.return_from_footnote(window, cx)))))
             .children(search_bar).child(div().flex_1().min_h_0().child(document))
     }
 }
 fn boundary(text: &str, offset: usize) -> usize {
     let mut offset = offset.min(text.len()); while !text.is_char_boundary(offset) { offset -= 1; } offset
 }
-fn byte_for_utf16(text: &str, units: usize) -> usize {
+fn byte_for_utf16(text: &str, units: usize, right_bias: bool) -> usize {
     let mut count = 0;
-    for (offset, c) in text.char_indices() { if count >= units { return offset; } count += c.len_utf16(); }
+    for (offset, ch) in text.char_indices() {
+        if units <= count { return offset; }
+        let next = count + ch.len_utf16();
+        if units < next { return if right_bias { offset + ch.len_utf8() } else { offset }; }
+        count = next;
+    }
     text.len()
+}
+fn input_text(text: &str, table: bool) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if table { text.replace('|', "\\|").replace('\n', "<br>") } else { text }
 }
