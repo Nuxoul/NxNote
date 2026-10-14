@@ -227,6 +227,13 @@ fn inline_formats(node: &Node, source: &str, output: &mut Vec<InlineFormat>) {
 fn inline_split(source: &str, cursor: usize, attachments: &Attachments) -> (usize, String, String) {
     let mut formats = Vec::new();
     if let Ok(root) = markdown::to_mdast(source, &ParseOptions::gfm()) { inline_formats(&root, source, &mut formats); }
+    for extension in crate::markdown_extensions::Extensions::parse(source).inline {
+        if matches!(&extension.kind, crate::markdown_extensions::InlineKind::Highlight
+            | crate::markdown_extensions::InlineKind::Superscript | crate::markdown_extensions::InlineKind::Subscript) {
+            formats.push(InlineFormat { open: source[extension.source.start..extension.content.start].into(),
+                close: source[extension.content.end..extension.source.end].into(), full: extension.source, content: extension.content });
+        }
+    }
     let images = attachments.references(source);
     formats.retain(|format| !images.iter().any(|(image, _)| image.start < format.full.end && image.end > format.full.start));
     let mut insertion = cursor;
@@ -346,12 +353,7 @@ fn decoded_unit(source: &str, cursor: usize, backwards: bool) -> Option<Range<us
                     else if rest.starts_with('&') {
                         rest.find(';').filter(|end| *end <= 32).map_or(1, |end| {
                             let candidate = &rest[..end + 1];
-                            let recognized = markdown::to_mdast(candidate, &ParseOptions::gfm()).ok().is_some_and(|root| {
-                                root.children().and_then(|children| children.first()).and_then(Node::children)
-                                    .and_then(|children| children.first()).is_some_and(|node| {
-                                        matches!(node, Node::Text(text) if text.value != candidate)
-                                    })
-                            });
+                            let recognized = crate::markdown_projection::decode_entity(candidate).is_some();
                             if recognized { end + 1 } else { 1 }
                         })
                     } else { rest.graphemes(true).next()?.len() };
@@ -506,5 +508,16 @@ mod source_unit_tests {
     fn entities_delete_as_display_units_but_unknown_names_do_not() {
         assert_eq!(delete("a&amp;b", 6..6, true, false, &Attachments::default(), &[]).unwrap().text, "ab");
         assert_eq!(delete("a&unknown;b", 10..10, true, false, &Attachments::default(), &[]).unwrap().text, "a&unknownb");
+    }
+}
+
+#[cfg(test)]
+mod extension_transaction_tests {
+    use super::*;
+    #[test]
+    fn highlighted_paragraph_split_balances_markers_in_one_transaction() {
+        let edit = newline("==abcd==", 4..4, false, &Attachments::default()).unwrap();
+        assert_eq!(edit.text, "==ab==\n==cd==");
+        assert_eq!(edit.selection, 9..9);
     }
 }

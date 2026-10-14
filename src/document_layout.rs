@@ -103,14 +103,6 @@ impl DocumentGeometry {
         Some(stop.source)
     }
 
-    pub fn source_steps(&self) -> Vec<usize> {
-        let mut steps: Vec<_> = self.rows.values().flat_map(|row| &row.lines).flat_map(|line| {
-            line.stops.iter().filter(move |stop| line.spans.is_empty() || line.spans.iter().any(|span| {
-                !span.source.is_empty() && (stop.source == span.source.start || stop.source == span.source.end)
-            })).map(|stop| stop.source)
-        }).collect();
-        steps.sort_unstable(); steps.dedup(); steps
-    }
 
     pub fn selection(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         self.rows.values().flat_map(|r| selection_quads(r, &range)).collect()
@@ -136,8 +128,10 @@ fn distance_to_interval(value: Pixels, start: Pixels, end: Pixels) -> Pixels {
     if value < start { start - value } else if value > end { value - end } else { px(0.) }
 }
 fn closest_x(stops: &[CaretStop], x: Pixels) -> Option<CaretStop> {
-    stops.iter().min_by(|a, b| (a.position.x - x).abs().partial_cmp(&(b.position.x - x).abs())
-        .unwrap_or(std::cmp::Ordering::Equal)).copied()
+    stops.iter().min_by(|a, b| {
+        let distance = (a.position.x - x).abs().partial_cmp(&(b.position.x - x).abs()).unwrap_or(std::cmp::Ordering::Equal);
+        distance.then_with(|| if x <= a.position.x.min(b.position.x) { a.source.cmp(&b.source) } else { b.source.cmp(&a.source) })
+    }).copied()
 }
 fn selection_quads(row: &RowGeometry, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
     if range.is_empty() { return Vec::new(); }
@@ -559,9 +553,14 @@ fn shape_fragment(text: &MappedText, range: Range<usize>, metrics: &Metrics, win
         let fraction = (current - first) as f32 / (last - first).max(1) as f32;
         line.x_for_index(start) + (line.x_for_index(end) - line.x_for_index(start)) * fraction
     }).collect();
-    let graphemes = boundaries.windows(2).enumerate().filter_map(|(index, pair)| {
-        text.source_for(range.start + pair[0]..range.start + pair[1]).map(|source| (source, positions[index], positions[index + 1]))
-    }).collect();
+    let mut graphemes: Vec<(Range<usize>, Pixels, Pixels)> = Vec::new();
+    for (index, pair) in boundaries.windows(2).enumerate() {
+        if let Some(source) = text.source_for(range.start + pair[0]..range.start + pair[1]) {
+            if let Some(previous) = graphemes.last_mut().filter(|previous| previous.0 == source) {
+                previous.2 = positions[index + 1];
+            } else { graphemes.push((source, positions[index], positions[index + 1])); }
+        }
+    }
     TextFragment { line, graphemes, baseline_offset: if script > 0 { -metrics.size * 0.22 } else if script < 0 { metrics.size * 0.22 } else { px(0.) } }
 }
 
@@ -734,4 +733,23 @@ fn paint_border(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
         Bounds::new(bounds.origin, size(px(1.), bounds.size.height)),
         Bounds::new(point(bounds.right() - px(1.), bounds.top()), size(px(1.), bounds.size.height)),
     ] { window.paint_quad(fill(quad, color)); }
+}
+
+#[cfg(test)]
+mod mapping_hit_tests {
+    use super::*;
+    #[test]
+    fn rendered_atom_chooses_nearest_outer_boundary() {
+        let stops = [CaretStop { source: 10, position: point(px(0.), px(0.)), height: px(20.) },
+            CaretStop { source: 30, position: point(px(60.), px(0.)), height: px(20.) }];
+        assert_eq!(closest_x(&stops, px(10.)).unwrap().source, 10);
+        assert_eq!(closest_x(&stops, px(50.)).unwrap().source, 30);
+    }
+    #[test]
+    fn hidden_aliases_have_deterministic_left_and_right_hits() {
+        let stops = [CaretStop { source: 0, position: point(px(0.), px(0.)), height: px(20.) },
+            CaretStop { source: 2, position: point(px(0.), px(0.)), height: px(20.) }];
+        assert_eq!(closest_x(&stops, px(-1.)).unwrap().source, 0);
+        assert_eq!(closest_x(&stops, px(1.)).unwrap().source, 2);
+    }
 }

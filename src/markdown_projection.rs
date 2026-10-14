@@ -92,14 +92,17 @@ impl Document {
     pub fn with_options(source: &str, cursor: usize, marked: Option<Range<usize>>, attachments: &Attachments, metadata_expanded: bool) -> Self {
         let extensions = crate::markdown_extensions::Extensions::parse(source);
         let composing = marked.is_some();
-        let mut builder = Builder { source, cursor, composing, marked: marked.clone(), attachments, rows: Vec::new(), definitions: BTreeMap::new() };
+        let mut builder = Builder { source, cursor, composing, marked: marked.clone(), attachments, rows: Vec::new(), definitions: BTreeMap::new(), masked_ranges: Vec::new() };
+        let mut masked_ranges = extensions.inline.iter().map(|extension| extension.source.clone()).collect::<Vec<_>>();
         let mut parse_source = extensions.mask_inline(source).into_bytes();
         for block in &extensions.blocks {
             if matches!(&block.kind, crate::markdown_extensions::BlockKind::FrontMatter | crate::markdown_extensions::BlockKind::Math | crate::markdown_extensions::BlockKind::Mermaid) {
+                masked_ranges.push(block.source.clone());
                 for byte in &mut parse_source[block.source.clone()] { if *byte != b'\n' && *byte != b'\r' { *byte = b'x'; } }
             }
             if matches!(&block.kind, crate::markdown_extensions::BlockKind::FootnoteDefinition { .. }) {
                 parse_source[block.source.start..block.content.start].fill(b'x');
+                masked_ranges.push(block.source.start..block.content.start);
             }
         }
         if let Some(marked) = marked.filter(|range| range.start <= range.end && range.end <= source.len()) {
@@ -109,6 +112,7 @@ impl Document {
                 if source[offset..].starts_with("<br>") { offset += 4; continue; }
                 let ch = source[offset..].chars().next().unwrap();
                 if ch.is_ascii_punctuation() && ch != '|' { parse_source[offset] = b'x'; }
+                masked_ranges.push(offset..offset + ch.len_utf8());
                 offset += ch.len_utf8();
             }
         }
@@ -116,14 +120,18 @@ impl Document {
         if let Ok(root) = markdown::to_mdast(source, &ParseOptions::gfm()) { protected_ranges(&root, &mut protected); }
         for (range, _) in attachments.references(source) {
             if protected.iter().any(|protected: &Range<usize>| range.start >= protected.start && range.end <= protected.end) { continue; }
-            parse_source[range].fill(b'x');
+            parse_source[range.clone()].fill(b'x');
+            masked_ranges.push(range);
         }
         let parse_source = String::from_utf8(parse_source).unwrap_or_else(|_| source.to_string());
         let mut links = Vec::new();
+        builder.masked_ranges = masked_ranges;
+        if let Ok(root) = markdown::to_mdast(source, &ParseOptions::gfm()) {
+            collect_definitions(&root, &mut builder.definitions);
+            collect_links(&root, &builder.definitions, &mut links);
+        }
         match markdown::to_mdast(&parse_source, &ParseOptions::gfm()) {
             Ok(Node::Root(root)) => {
-                collect_definitions(&Node::Root(root.clone()), &mut builder.definitions);
-                collect_links(&Node::Root(root.clone()), &builder.definitions, &mut links);
                 for node in &root.children {
                     builder.block(node, 0, 0, None, None);
                 }
@@ -164,13 +172,21 @@ struct Builder<'a> {
     attachments: &'a Attachments,
     rows: Vec<Row>,
     definitions: BTreeMap<String, String>,
+    masked_ranges: Vec<Range<usize>>,
 }
 impl Builder<'_> {
     fn row(&self, source: Range<usize>, cells: Vec<Cell>, indent: usize, quote: usize) -> Row {
         Row { source, cells, heading: 0, indent, quote, marker: None, task: None, list_content: false,
             code: false, rule: false, table: false, table_head: false, gap: false, callout: None, annotation: None }
     }
-    fn push_text_lines(&mut self, row: Row) {
+    fn push_text_lines(&mut self, mut row: Row) {
+        // Reading parsers can omit final whitespace from block positions. The
+        // editor owns the physical line suffix, not merely the parsed content.
+        let physical_end = self.source[row.source.end..].find('\n').map_or(self.source.len(), |offset| row.source.end + offset);
+        let suffix = &self.source[row.source.end..physical_end];
+        if suffix.chars().all(|ch| matches!(ch, ' ' | '\t' | '\r')) {
+            row.source.end += suffix.trim_end_matches('\r').len();
+        }
         // Physical source lines, not parser Text nodes, define editable rows.
         // Blank-line reconciliation is independent of AST container spans.
         let multiline_atom = row.cells.iter().flat_map(|cell| &cell.inline).any(|inline| match inline {
@@ -203,6 +219,22 @@ impl Builder<'_> {
                     }
                     _ => {}
                 }
+            }
+            if row.indent == 0 && row.quote == 0 && row.heading == 0 {
+                let first = inline.first().map(inline_start).unwrap_or(end);
+                let leading_end = start + self.source[start..end].len() - self.source[start..end].trim_start_matches([' ', '\t']).len();
+                if start < first.min(leading_end) {
+                    let mut prefix = Vec::new(); self.raw_text(start..first.min(leading_end), Marks::default(), &mut prefix);
+                    prefix.extend(inline); inline = prefix;
+                }
+            }
+            // Preserve whitespace excluded from Text values (including hard-
+            // break spaces), without revealing concealed Markdown delimiters.
+            let mapped_end = inline.last().map(inline_end).unwrap_or(start);
+            let whitespace_start = start + self.source[start..end].trim_end_matches([' ', '\t']).len();
+            let missing_start = mapped_end.max(whitespace_start);
+            if missing_start < end && (!inline.is_empty() || whitespace_start == start) {
+                self.raw_text(missing_start..end, Marks::default(), &mut inline);
             }
             let content_start = inline.first().map(inline_start).unwrap_or(start);
             let content_end = inline.last().map(inline_end).unwrap_or(content_start);
@@ -435,13 +467,26 @@ impl Builder<'_> {
                     row.rule = true; self.rows.push(row);
                 }
             }
-            Node::Definition(_) => {} // Reference definitions are source metadata, not a separate reading block.
+            Node::Definition(_) => self.plain(range, indent, quote, false),
             _ => {
+                if matches!(node, Node::Paragraph(_)) && indent == 0 && quote == 0 && marker.is_none() {
+                    let physical_start = self.source[..range.start].rfind('\n').map_or(0, |offset| offset + 1);
+                    if self.source[physical_start..range.start].chars().all(|ch| matches!(ch, ' ' | '\t')) {
+                        range.start = physical_start;
+                    }
+                }
                 let mut inline = Vec::new();
                 if let Some(children) = node.children() {
                     for child in children { self.inline(child, Marks::default(), &mut inline); }
                 } else { self.raw(range.clone(), Marks::default(), &mut inline); }
                 let heading = if let Node::Heading(heading) = node { heading.depth } else { 0 };
+                if matches!(node, Node::Paragraph(_)) {
+                    let first = inline.first().map(inline_start).unwrap_or(range.start);
+                    if first > range.start && self.source[range.start..first].chars().all(|ch| matches!(ch, ' ' | '\t')) {
+                        let mut prefix = Vec::new(); self.raw_text(range.start..first, Marks::default(), &mut prefix);
+                        prefix.extend(inline); inline = prefix;
+                    }
+                }
                 let visible_start = inline.first().map(inline_start).unwrap_or(if heading > 0 { range.end } else { range.start });
                 if heading > 0 && self.cursor >= range.start && self.cursor <= visible_start && !self.composing {
                     let mut prefix = Vec::new();
@@ -464,8 +509,46 @@ impl Builder<'_> {
             }
         }
     }
+    fn restored_text(&self, range: Range<usize>, marks: Marks, output: &mut Vec<Inline>) {
+        let mut spans = self.masked_ranges.iter().filter(|masked| masked.start < range.end && masked.end > range.start)
+            .map(|masked| masked.start.max(range.start)..masked.end.min(range.end)).collect::<Vec<_>>();
+        spans.sort_by_key(|span| (span.start, span.end));
+        let mut offset = range.start;
+        for span in spans {
+            if offset < span.start { self.unmasked_text(offset..span.start, marks, output); }
+            let start = offset.max(span.start);
+            if start < span.end { self.raw(start..span.end, marks, output); }
+            offset = offset.max(span.end);
+        }
+        if offset < range.end { self.unmasked_text(offset..range.end, marks, output); }
+    }
+    fn unmasked_text(&self, range: Range<usize>, marks: Marks, output: &mut Vec<Inline>) {
+        let mut offset = range.start;
+        while offset < range.end {
+            let rest = &self.source[offset..range.end];
+            if rest.starts_with('\\') && rest[1..].chars().next().is_some_and(|ch| ch.is_ascii_punctuation()) {
+                let value = rest[1..2].to_string();
+                output.push(Inline::Text { text: value, map: vec![SourceChar { display: 0..1, source: offset..offset + 2 }], marks });
+                offset += 2; continue;
+            }
+            if rest.starts_with('&') {
+                if let Some(end) = rest.find(';').filter(|end| *end <= 32) {
+                    if let Some(value) = decode_entity(&rest[..end + 1]) {
+                        let source = offset..offset + end + 1;
+                        let map = value.char_indices().map(|(start, ch)| SourceChar { display: start..start + ch.len_utf8(), source: source.clone() }).collect();
+                        output.push(Inline::Text { text: value, map, marks }); offset += end + 1; continue;
+                    }
+                }
+            }
+            let ch = rest.chars().next().unwrap();
+            self.raw_text(offset..offset + ch.len_utf8(), marks, output); offset += ch.len_utf8();
+        }
+    }
     fn inline(&self, node: &Node, mut marks: Marks, output: &mut Vec<Inline>) {
         let range = node_range(node);
+        if matches!(node, Node::Text(_)) && self.masked_ranges.iter().any(|masked| masked.start < range.end && masked.end > range.start) {
+            self.restored_text(range, marks, output); return;
+        }
         if matches!(node, Node::Text(_)) && self.marked.as_ref().is_some_and(|marked| marked.start < range.end && marked.end > range.start) {
             self.raw(range, marks, output); return;
         }
@@ -579,10 +662,7 @@ impl Builder<'_> {
                 if let Some(end) = source[index..].find(';').filter(|end| *end < 32) {
                     let entity_end = index + end + 1;
                     let entity = &source[start..entity_end];
-                    let decoded = markdown::to_html(entity);
-                    let decoded = decoded.trim_end_matches('\n');
-                    let decoded = decoded.strip_prefix("<p>").and_then(|s| s.strip_suffix("</p>")).unwrap_or(entity);
-                    let decoded = decoded.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">");
+                    let decoded = decode_entity(entity).unwrap_or_else(|| entity.to_string());
                     if decoded != entity {
                         chars.push((decoded, range.start + start..range.start + entity_end));
                         index = entity_end; continue;
@@ -615,12 +695,19 @@ impl Builder<'_> {
                         found = Some(source.clone()); break;
                     }
                 }
-                let source = found.unwrap_or_else(|| range.end..range.end);
+                let Some(source) = found else { self.raw(range, marks, output); return; };
                 map.push(SourceChar { display: display..display + ch.len_utf8(), source });
             }
             output.push(Inline::Text { text: value.to_string(), map, marks });
         }
     }
+}
+pub(crate) fn decode_entity(entity: &str) -> Option<String> {
+    let root = markdown::to_mdast(entity, &ParseOptions::gfm()).ok()?;
+    let paragraph = root.children()?.first()?;
+    let children = paragraph.children()?;
+    let [Node::Text(text)] = children.as_slice() else { return None; };
+    (text.value != entity).then(|| text.value.clone())
 }
 pub fn node_range(node: &Node) -> Range<usize> {
     node.position().map(|p| p.start.offset..p.end.offset).unwrap_or(0..0)
@@ -773,5 +860,104 @@ mod list_alignment_tests {
         let document = Document::new(source, 0, None, &Attachments::default());
         assert_eq!(document.rows[0].content_inset(), 0.);
         assert!(document.rows[0].marker.is_none());
+    }
+}
+
+#[cfg(test)]
+mod whitespace_editing_tests {
+    use super::*;
+    #[test]
+    fn ordinary_marker_like_text_keeps_each_inserted_trailing_space() {
+        for prefix in ["-1", "1.32", "1234", "中文🙂", "- item", "1. item"] {
+            for count in 1..=4 {
+                let source = format!("{prefix}{}", " ".repeat(count));
+                let document = Document::new(&source, source.len(), None, &Attachments::default());
+                for offset in prefix.len()..source.len() {
+                    assert!(document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline).any(|inline| {
+                        if let Inline::Text { text, map, .. } = inline {
+                            map.iter().any(|character| character.source == (offset..offset + 1)
+                                && text.get(character.display.clone()) == Some(" "))
+                        } else { false }
+                    }), "missing space at {offset} in {source:?}");
+                }
+                assert_eq!(document.rows.last().unwrap().cells.last().unwrap().source.end, source.len());
+            }
+        }
+    }
+    #[test]
+    fn paragraph_leading_whitespace_is_editable_source_not_hidden_syntax() {
+        let source = "  -1 ";
+        let document = Document::new(source, source.len(), None, &Attachments::default());
+        let text: String = document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline)
+            .filter_map(|inline| if let Inline::Text { text, .. } = inline { Some(text.as_str()) } else { None }).collect();
+        assert_eq!(text, source);
+    }
+    #[test]
+    fn non_list_prefixes_stay_plain_before_and_after_space_input() {
+        for source in ["-1", "-1 ", "1.32", "1.32 "] {
+            let document = Document::new(source, source.len(), None, &Attachments::default());
+            assert!(document.rows.iter().all(|row| row.marker.is_none() && !row.list_content));
+            let visible: String = document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline)
+                .filter_map(|inline| if let Inline::Text { text, .. } = inline { Some(text.as_str()) } else { None }).collect();
+            assert_eq!(visible, source);
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_mapping_invariants {
+    use super::*;
+    fn visible(document: &Document) -> String {
+        document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline)
+            .filter_map(|inline| if let Inline::Text { text, .. } = inline { Some(text.as_str()) } else { None }).collect()
+    }
+    #[test]
+    fn extension_masking_never_becomes_display_text() {
+        let source = "plain ==高亮== &amp; [[目标|别名]] tail ";
+        let document = Document::new(source, source.len(), None, &Attachments::default());
+        assert_eq!(visible(&document), "plain 高亮 & 别名 tail ");
+        for cell in document.rows.iter().flat_map(|row| &row.cells) {
+            for inline in &cell.inline {
+                if let Inline::Text { text, map, .. } = inline {
+                    for character in map {
+                        assert!(text.get(character.display.clone()).is_some());
+                        assert!(!character.source.is_empty());
+                        assert!(source.get(character.source.clone()).is_some());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn reference_definition_keeps_original_destination_and_editable_metadata() {
+        let source = "[go][target]\n\n[target]: https://example.com/#part";
+        let document = Document::new(source, source.len(), None, &Attachments::default());
+        assert!(visible(&document).contains("[target]: https://example.com/#part"));
+        assert!(document.links.iter().any(|link| matches!(&link.target, LinkTarget::External(url) if url == "https://example.com/#part")));
+    }
+    #[test]
+    fn composition_punctuation_is_exact_source_not_parser_placeholder() {
+        let source = "word **中";
+        let document = Document::new(source, source.len(), Some(5..source.len()), &Attachments::default());
+        assert_eq!(visible(&document), source);
+    }
+}
+
+#[cfg(test)]
+mod whitespace_line_invariants {
+    use super::*;
+    #[test]
+    fn whitespace_only_and_continuation_lines_keep_every_space() {
+        for source in ["first\n   \nlast", "first\n  second ", "-1 \n1.32  "] {
+            let document = Document::new(source, source.len(), None, &Attachments::default());
+            for (offset, ch) in source.char_indices().filter(|(_, ch)| *ch == ' ') {
+                assert!(document.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.inline).any(|inline| {
+                    if let Inline::Text { text, map, .. } = inline {
+                        map.iter().any(|character| character.source == (offset..offset + ch.len_utf8())
+                            && text.get(character.display.clone()) == Some(" "))
+                    } else { false }
+                }), "missing space at {offset} in {source:?}");
+            }
+        }
     }
 }

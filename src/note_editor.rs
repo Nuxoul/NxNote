@@ -34,6 +34,7 @@ pub struct NoteEditor {
     marked: Option<Range<usize>>,
     composition_before: Option<Snapshot>,
     document: Rc<Document>,
+    source_map: crate::source_map::SourceMap,
     geometry: Rc<RefCell<DocumentGeometry>>,
     scroll: ScrollHandle,
     style: gpui_kit::base::TextViewStyle,
@@ -85,10 +86,12 @@ impl NoteEditor {
             if composing { cx.emit(InputEvent::Change); }
             cx.emit(InputEvent::Blur); cx.notify();
         });
+        let document = Rc::new(Document::new(text, 0, None, &attachments));
+        let source_map = crate::source_map::SourceMap::new(text, &document);
         Self {
             focus, search, search_open: false, text: text.to_string().into(), selection: 0..0,
             reversed: false, marked: None, composition_before: None,
-            document: Rc::new(Document::new(text, 0, None, &attachments)),
+            document, source_map,
             geometry: Rc::new(RefCell::new(DocumentGeometry::default())), scroll: ScrollHandle::new(),
             style: gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx)),
             undo: Vec::new(), redo: Vec::new(), last_edit: None,
@@ -115,7 +118,9 @@ impl NoteEditor {
     fn anchor(&self) -> usize { if self.reversed { self.selection.end } else { self.selection.start } }
     fn snapshot(&self) -> Snapshot { Snapshot { text: self.text.clone(), selection: self.selection.clone(), reversed: self.reversed } }
     fn rebuild(&mut self) {
+        self.geometry.borrow_mut().clear();
         self.document = Rc::new(Document::with_options(&self.text, self.cursor(), self.marked.clone(), &self.attachments, self.metadata_expanded));
+        self.source_map = crate::source_map::SourceMap::new(&self.text, &self.document);
     }
     pub fn set_selected_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let start = boundary(&self.text, range.start);
@@ -158,20 +163,13 @@ impl NoteEditor {
         if self.undo.len() > 200 { self.undo.remove(0); }
         self.redo.clear(); self.last_edit = if coalesce { Some((now, range.start)) } else { None };
     }
-    fn normalize_image_range(&self, mut range: Range<usize>) -> Range<usize> {
-        for image in self.document.images() {
-            if range.is_empty() {
-                if range.start > image.start && range.start < image.end { range = image.end..image.end; }
-            } else if range.start < image.end && range.end > image.start {
-                range.start = range.start.min(image.start); range.end = range.end.max(image.end);
-            }
-        }
-        range
+    fn normalize_edit_range(&self, range: Range<usize>) -> Range<usize> {
+        self.source_map.replacement_range(&self.text, range)
     }
     fn edit(&mut self, range: Range<usize>, value: &str, coalesce: bool, window: &mut Window, cx: &mut Context<Self>) {
         let start = boundary(&self.text, range.start);
         let end = boundary(&self.text, range.end).max(start);
-        let range = self.normalize_image_range(start..end);
+        let range = self.normalize_edit_range(start..end);
         if self.text.get(range.clone()) == Some(value) { return; }
         let coalesce = coalesce && !value.chars().any(char::is_whitespace);
         let empty_code = range.is_empty() && !value.is_empty() && self.document.rows.iter().any(|row| {
@@ -229,24 +227,7 @@ impl NoteEditor {
         }));
     }
     fn step(&self, backwards: bool, word: bool) -> usize {
-        let cursor = self.cursor();
-        let stops = self.geometry.borrow().source_steps();
-        let next = if backwards { stops.iter().copied().rev().find(|s| *s < cursor) }
-            else { stops.iter().copied().find(|s| *s > cursor) };
-        if word {
-            let target = if backwards {
-                self.text[..cursor].unicode_word_indices().next_back().map_or(0, |(start, _)| start)
-            } else {
-                self.text[cursor..].unicode_word_indices().next().map_or(self.text.len(), |(start, word)| cursor + start + word.len())
-            };
-            return if backwards { stops.iter().copied().rev().find(|s| *s <= target).unwrap_or(target) }
-                else { stops.iter().copied().find(|s| *s >= target).unwrap_or(target) };
-        }
-        next.unwrap_or_else(|| if backwards {
-            self.text[..cursor].grapheme_indices(true).next_back().map_or(0, |(start, _)| start)
-        } else {
-            self.text[cursor..].graphemes(true).next().map_or(cursor, |g| cursor + g.len())
-        })
+        self.source_map.step(&self.text, self.cursor(), backwards, word)
     }
     fn horizontal(&mut self, backwards: bool, extend: bool, word: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_some() { return; }
@@ -261,13 +242,14 @@ impl NoteEditor {
         let geometry = self.geometry.borrow();
         let x = self.preferred_x.or_else(|| geometry.caret(cursor).map(|c| c.position.x)).unwrap_or(px(0.));
         let target = geometry.vertical(cursor, x, direction).map(|c| c.source)
-            .unwrap_or(if direction < 0 { 0 } else { self.text.len() });
+            .unwrap_or_else(|| self.source_map.vertical(&self.text, cursor, direction));
         drop(geometry); self.select_to(target, extend, window, cx); self.preferred_x = Some(x);
     }
     fn edge(&mut self, end: bool, extend: bool, document: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_some() { return; }
         let target = if document { if end { self.text.len() } else { 0 } }
-            else { self.geometry.borrow().line_edge(self.cursor(), end).unwrap_or(self.cursor()) };
+            else { self.geometry.borrow().line_edge(self.cursor(), end)
+                .unwrap_or_else(|| self.source_map.line_edge(&self.text, self.cursor(), end)) };
         self.preferred_x = None; self.select_to(target, extend, window, cx);
     }
     fn page(&mut self, direction: i32, window: &mut Window, cx: &mut Context<Self>) {
@@ -294,27 +276,22 @@ impl NoteEditor {
     }
     fn delete(&mut self, backwards: bool, word: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.marked.is_some() { return; }
-        let atoms = self.document.images().cloned().collect::<Vec<_>>();
+        let selection = self.normalize_edit_range(self.selection.clone());
+        let atoms = self.source_map.atoms().to_vec();
         // Table cells are bounded editing regions, not paragraph merge targets.
         if self.selection.is_empty() {
             if let Some((row, column)) = self.document.cell_at(self.cursor()) {
                 let cell = &self.document.rows[row].cells[column];
                 let cursor = self.cursor();
                 if (backwards && cursor == cell.source.start) || (!backwards && cursor == cell.source.end) { return; }
-                let text = &self.text[cell.source.clone()];
-                let relative = cursor - cell.source.start;
-                let target = if word && backwards {
-                    text[..relative].unicode_word_indices().next_back().map_or(0, |(start, _)| start)
-                } else if word {
-                    text[relative..].unicode_word_indices().next().map_or(text.len(), |(start, word)| relative + start + word.len())
-                } else if backwards {
-                    text[..relative].grapheme_indices(true).next_back().map_or(relative, |(start, _)| start)
-                } else { text[relative..].graphemes(true).next().map_or(relative, |grapheme| relative + grapheme.len()) };
-                let target = cell.source.start + target;
+                let cursor = if backwards { selection.start } else { selection.end };
+                let target = if !word {
+                    self.source_map.adjacent(cursor, backwards).map_or(cursor, |unit| if backwards { unit.start } else { unit.end })
+                } else { self.source_map.step(&self.text, cursor, backwards, true) }.clamp(cell.source.start, cell.source.end);
                 self.edit(cursor.min(target)..cursor.max(target), "", false, window, cx); return;
             }
         }
-        if let Some(edit) = crate::markdown_edit::delete(&self.text, self.selection.clone(), backwards, word, &self.attachments, &atoms) {
+        if let Some(edit) = crate::markdown_edit::delete(&self.text, selection, backwards, word, &self.attachments, &atoms) {
             self.apply_format_edit(edit, window, cx);
         }
     }
@@ -327,7 +304,7 @@ impl NoteEditor {
             self.edit(self.selection.clone(), "<br>", false, window, cx);
             cx.emit(InputEvent::PressEnter { secondary, shift }); return;
         }
-        let selection = self.normalize_image_range(self.selection.clone());
+        let selection = self.normalize_edit_range(self.selection.clone());
         if let Some(edit) = crate::markdown_edit::newline(&self.text, selection, shift, &self.attachments) {
             self.apply_format_edit(edit, window, cx);
             cx.emit(InputEvent::PressEnter { secondary, shift });
@@ -373,7 +350,10 @@ impl NoteEditor {
         self.edit(start..end, &replacement, false, window, cx);
     }
     fn copy(&self, cx: &mut Context<Self>) {
-        if !self.selection.is_empty() { cx.write_to_clipboard(ClipboardItem::new_string(self.text[self.selection.clone()].to_string())); }
+        if !self.selection.is_empty() {
+            let range = self.normalize_edit_range(self.selection.clone());
+            cx.write_to_clipboard(ClipboardItem::new_string(self.text[range].to_string()));
+        }
     }
     fn cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selection.is_empty() { self.copy(cx); self.edit(self.selection.clone(), "", false, window, cx); }
@@ -542,7 +522,8 @@ impl EntityInputHandler for NoteEditor {
     }
     fn set_selected_text_range(&mut self, range_utf16: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let range = self.from_utf16(range_utf16);
-        self.set_selected_range(self.normalize_image_range(range), cx);
+        let range = if self.composition_before.is_some() { range } else { self.normalize_edit_range(range) };
+        self.set_selected_range(range, cx);
         self.restart_blink(window, cx);
     }
     fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
@@ -563,7 +544,7 @@ impl EntityInputHandler for NoteEditor {
     }
     fn replace_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let range = range.map(|r| self.from_utf16(r)).or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
-        let range = self.normalize_image_range(range);
+        let range = if self.composition_before.is_some() { range } else { self.normalize_edit_range(range) };
         let value = input_text(text, self.document.cell_at(range.start).is_some());
         if self.composition_before.is_some() {
             self.apply(range, &value); self.commit_composition(); self.changed(window, cx);
@@ -571,7 +552,7 @@ impl EntityInputHandler for NoteEditor {
     }
     fn replace_and_mark_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>, _window: &mut Window, cx: &mut Context<Self>) {
         let range = range.map(|range| self.from_utf16(range)).or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
-        let range = self.normalize_image_range(range);
+        let range = if self.composition_before.is_some() { range } else { self.normalize_edit_range(range) };
         let table = self.document.cell_at(range.start).is_some();
         let value = input_text(text, table);
         if self.composition_before.is_none() { self.composition_before = Some(self.snapshot()); }
@@ -614,7 +595,7 @@ impl Render for NoteEditor {
         let caret_visible = self.caret_visible || self.marked.is_some();
         let cursor = self.cursor();
         let line_starts: Vec<usize> = std::iter::once(0).chain(self.text.match_indices('\n').map(|(offset, _)| offset + 1)).collect();
-        let gutter_width = px((line_starts.len().to_string().len() as f32 * 8. + 20.).max(44.));
+        let gutter_width = px((line_starts.len().to_string().len() as f32 * 8. + 10.).max(28.));
         let geometry = self.geometry.clone();
         let font = font(cx.theme().mono_font_family.clone()); let font_size = cx.theme().mono_font_size;
         let rows = self.document.rows.iter().cloned().enumerate().map(|(index, row)| DocumentRow {
@@ -672,7 +653,7 @@ impl Render for NoteEditor {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .child(div().id("document-scroll").relative().v_flex().flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).px_3().py_2()
+            .child(div().id("document-scroll").relative().v_flex().flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).px(px(6.)).py_2()
                 .child(canvas(move |_, _, _| { clear.borrow_mut().clear(); }, |_, _, _, _| {}).h(px(0.)).w_full())
                 .children(rows)
                 .child(div().id("document-end").h(px(80.)).w_full())
@@ -690,11 +671,11 @@ impl Render for NoteEditor {
                             let run = TextRun { len: label.len(), font: gutter_font.clone(), color: gutter_color,
                                 background_color: None, underline: None, strikethrough: None };
                             let shaped = window.text_system().shape_line(label.into(), px(13.), &[run], None);
-                            let x = viewport.left() + px(12.) + gutter_width - px(10.) - shaped.width();
+                            let x = viewport.left() + px(6.) + gutter_width - px(6.) - shaped.width();
                             let _ = shaped.paint(point(x, caret.position.y), caret.height, TextAlign::Left, None, window, cx);
                         }
                     }
-                    window.paint_quad(fill(Bounds::new(point(viewport.left() + px(12.) + gutter_width, viewport.top()),
+                    window.paint_quad(fill(Bounds::new(point(viewport.left() + px(6.) + gutter_width, viewport.top()),
                         size(px(1.), viewport.size.height)), gutter_color.opacity(0.25)));
                     });
                     let move_input = input.clone();

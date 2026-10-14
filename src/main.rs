@@ -21,6 +21,7 @@ mod platform;
 mod session;
 mod settings_ui;
 mod storage;
+mod source_map;
 mod theme;
 mod tray;
 mod watcher;
