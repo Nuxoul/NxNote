@@ -70,6 +70,7 @@ pub struct SettingsView {
     font_size: Entity<InputState>,
     ui_font_size: Entity<InputState>,
     line_height: Entity<InputState>,
+    paragraph_spacing: Entity<InputState>,
     window_width: Entity<InputState>,
     window_height: Entity<InputState>,
     autosave_delay: Entity<InputState>,
@@ -90,11 +91,18 @@ pub fn open(
     cfg: Config,
     on_apply: impl Fn(Config, &mut Window, &mut App) -> bool + 'static,
     cx: &mut App,
-) -> anyhow::Result<Entity<SettingsView>> {
+) -> anyhow::Result<(gpui_kit::AnyWindowHandle, Entity<SettingsView>)> {
+    let metrics = crate::theme::LayoutMetrics::from_app(cx);
+    let available = cx.primary_display().map(|display| display.visible_bounds().size)
+        .unwrap_or(size(px(1280.), px(900.)));
+    let initial_size = size(
+        metrics.ui(880.).max(px(640.)).min((available.width - px(48.)).max(px(220.))),
+        metrics.ui(800.).max(px(480.)).min((available.height - px(48.)).max(px(200.))),
+    );
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(720.), px(650.)),
+            initial_size,
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
@@ -102,16 +110,24 @@ pub fn open(
             appears_transparent: true,
             ..Default::default()
         }),
+        window_min_size: Some(size(px(560.).min(initial_size.width), px(360.).min(initial_size.height))),
         ..Default::default()
     };
     let callback: Rc<ApplyCallback> = Rc::new(on_apply);
-    let (_, view) = gpui_kit::open_window(options, cx, move |window, cx| {
+    let (handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
+        // Windows TitleBar controls send WM_CLOSE; its on_close_window hook
+        // is Linux-only. Remove through GPUI and veto synchronous native
+        // destruction, matching Cancel's deferred window teardown.
+        window.on_window_should_close(cx, |window, cx| {
+            window.defer(cx, |window, _| window.remove_window());
+            false
+        });
         let cfg = cfg.clone();
         let callback = callback.clone();
         cx.new(|cx| SettingsView::new(cfg, callback, window, cx))
     })
     .map_err(|error| anyhow!("无法打开设置窗口: {error}"))?;
-    Ok(view)
+    Ok((handle, view))
 }
 
 impl SettingsView {
@@ -127,6 +143,8 @@ impl SettingsView {
             .default_value(format!("{:.1}", crate::config::normalize_line_height(draft.line_height)))
             .step(0.1).min(crate::config::MIN_LINE_HEIGHT as f64).max(crate::config::MAX_LINE_HEIGHT as f64)
             .mask_pattern(gpui_kit::base::input::MaskPattern::Number { separator: None, fraction: Some(1) }));
+        let paragraph_spacing = number_state(draft.paragraph_spacing.min(crate::config::MAX_PARAGRAPH_SPACING) as f64,
+            0., crate::config::MAX_PARAGRAPH_SPACING as f64, 1., window, cx);
         let window_width = number_state(draft.window_width as f64, 220., 1600., 1., window, cx);
         let window_height = number_state(draft.window_height as f64, 200., 1600., 1., window, cx);
         let autosave_delay = number_state(
@@ -157,6 +175,7 @@ impl SettingsView {
             &font_size,
             &ui_font_size,
             &line_height,
+            &paragraph_spacing,
             &window_width,
             &window_height,
             &autosave_delay,
@@ -236,6 +255,7 @@ impl SettingsView {
             font_size,
             ui_font_size,
             line_height,
+            paragraph_spacing,
             window_width,
             window_height,
             autosave_delay,
@@ -286,9 +306,11 @@ impl SettingsView {
         let font_size = read_font_size(&self.font_size, "正文字号", cx)?;
         let ui_font_size = read_font_size(&self.ui_font_size, "界面字号", cx)? as u16;
         let line_height = crate::config::normalize_line_height(read_number(
-            &self.line_height, "正文行间距", crate::config::MIN_LINE_HEIGHT as f64,
+            &self.line_height, "段内行高", crate::config::MIN_LINE_HEIGHT as f64,
             crate::config::MAX_LINE_HEIGHT as f64, cx,
         )? as f32);
+        let paragraph_spacing = read_number(&self.paragraph_spacing, "段落间距", 0.,
+            crate::config::MAX_PARAGRAPH_SPACING as f64, cx)?.round() as u16;
         let window_width = read_number(&self.window_width, "默认宽度", 220., 1600., cx)? as f32;
         let window_height = read_number(&self.window_height, "默认高度", 200., 1600., cx)? as f32;
         let autosave_delay_ms =
@@ -324,6 +346,7 @@ impl SettingsView {
         config.font_size = font_size;
         config.ui_font_size = ui_font_size;
         config.line_height = line_height;
+        config.paragraph_spacing = paragraph_spacing;
         config.window_width = window_width;
         config.window_height = window_height;
         config.autosave_delay_ms = autosave_delay_ms;
@@ -382,9 +405,15 @@ impl SettingsView {
             )
             .child(
                 Field::new()
-                    .label("正文行间距")
-                    .description("行高为字号的 1.0–2.5 倍，步长 0.1；默认 1.5，不改变段落间距")
+                    .label("段内行高（自动折行）")
+                    .description("同一段内各行的高度，0.5–2.5 倍；默认 1.5，不控制两段之间的空白")
                     .child(NumberInput::new(&self.line_height).suffix("倍")),
+            )
+            .child(
+                Field::new()
+                    .label("段落间距（回车后）")
+                    .description("两段正文之间额外的空白，0–48 px；默认 0，不压缩自动折行的文字，也不删除空段")
+                    .child(NumberInput::new(&self.paragraph_spacing).suffix("px")),
             )
             .child(
                 Field::new()
@@ -401,7 +430,7 @@ impl SettingsView {
             .child(
                 Field::new()
                     .label("编辑字体")
-                    .description("可搜索、多选；选择顺序即回退顺序")
+                    .description("保留原有字体设置；正文和代码共用，行号使用独立等宽字体")
                     .child(
                         Combobox::new(&self.editor_fonts)
                             .placeholder("选择编辑字体")
@@ -563,7 +592,9 @@ impl Render for SettingsView {
             .text_color(cx.theme().foreground)
             .font_family(cx.theme().font_family.clone())
             .text_size(cx.theme().font_size)
-            .child(TitleBar::new().child("NxNote 设置"))
+            .child(TitleBar::new().child("NxNote 设置").on_close_window(|_, window, cx| {
+                window.defer(cx, |window, _| window.remove_window());
+            }))
             .child(
                 div().px_6().pt_5().pb_3().child(
                     TabBar::new("settings-sections")
@@ -612,7 +643,7 @@ impl Render for SettingsView {
                             .child(
                                 Button::new("cancel-settings")
                                     .label("取消")
-                                    .on_click(|_, window, _| window.remove_window()),
+                                    .on_click(|_, window, cx| window.defer(cx, |window, _| window.remove_window())),
                             )
                             .child(
                                 Button::new("apply-settings")

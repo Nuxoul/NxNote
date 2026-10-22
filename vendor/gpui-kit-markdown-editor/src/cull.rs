@@ -179,6 +179,7 @@ struct Geometry {
     font: Font,
     font_size: Pixels,
     line_height: Pixels,
+    paragraph_gap: Pixels,
     white_space: WhiteSpace,
     text_overflow: Option<TextOverflow>,
     line_clamp: Option<usize>,
@@ -193,6 +194,7 @@ impl CullState {
         width: Pixels,
         rem_size: Pixels,
         typography: &TextStyle,
+        paragraph_gap: Pixels,
     ) -> bool {
         let geometry = Geometry {
             width,
@@ -200,6 +202,7 @@ impl CullState {
             font: typography.font(),
             font_size: typography.font_size.to_pixels(rem_size),
             line_height: typography.line_height_in_pixels(rem_size),
+            paragraph_gap,
             white_space: typography.white_space,
             text_overflow: typography.text_overflow.clone(),
             line_clamp: typography.line_clamp,
@@ -324,6 +327,20 @@ impl Element for Measured {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paragraph_gap_invalidates_cached_heights() {
+        let mut cull = CullState::default();
+        let typography = TextStyle::default();
+        assert!(!cull.set_geometry(px(400.), px(16.), &typography, px(12.)));
+        let id = BlockId::next();
+        cull.heights.insert(id, px(40.));
+        assert!(!cull.set_geometry(px(400.), px(16.), &typography, px(12.)));
+        assert!(cull.heights.contains_key(&id));
+        assert!(cull.set_geometry(px(400.), px(16.), &typography, px(0.)));
+        assert!(cull.heights.is_empty());
+        assert!(!cull.set_geometry(px(400.), px(16.), &typography, px(0.)));
+    }
 
     #[test]
     fn height_index_prefix_find_and_update() {

@@ -76,7 +76,7 @@ impl LineNumbers {
     }
     pub(crate) fn paint(
         &self, frame: &FrameLayout, bounds: Bounds<Pixels>, width: Pixels, caret: Option<BlockPosition>,
-        typography: &TextStyle, style: &BlockEditorStyle, window: &mut Window, cx: &mut App,
+        typography: &TextStyle, _style: &BlockEditorStyle, window: &mut Window, cx: &mut App,
     ) {
         let Some(content) = frame.content else { return; };
         if width <= px(0.) { return; }
@@ -107,7 +107,7 @@ impl LineNumbers {
         let (font_size, font) = number_style(typography, window);
         let label_height = font_size * 1.5;
         let tokens = gpui_kit::base::Theme::global(cx).tokens.colors;
-        let mut background = tokens.secondary;
+        let mut background = tokens.background;
         background.a = 1.;
         window.with_content_mask(Some(ContentMask { bounds: gutter }), |window| {
             window.paint_quad(fill(gutter, background));
@@ -117,7 +117,7 @@ impl LineNumbers {
             let edge = px((f32::from(gutter.right()) * scale).floor() / scale);
             window.paint_quad(fill(
                 Bounds::new(point(edge - thickness, gutter.top()), size(thickness, gutter.size.height)),
-                tokens.border,
+                tokens.border.opacity(0.55),
             ));
             let clip = window.content_mask().bounds;
             for (number, (y, line_height, _caret_height, bottom)) in rows {
@@ -127,7 +127,7 @@ impl LineNumbers {
                 let text = number.to_string();
                 let mut run = typography.to_run(text.len());
                 run.font = font.clone();
-                run.color = if selected { tokens.primary } else { tokens.muted_foreground };
+                run.color = if selected { tokens.foreground } else { tokens.muted_foreground.opacity(0.8) };
                 run.background_color = None;
                 run.underline = None;
                 run.strikethrough = None;

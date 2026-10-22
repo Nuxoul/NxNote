@@ -9,14 +9,14 @@ use gpui_kit::component::{
     command::{Command, CommandItem, CommandState},
     dialog::{DialogAction, DialogClose, DialogFooter},
     input::{Input, InputEvent, InputState},
-    menu::DropdownMenu,
+    menu::{DropdownMenu, PopupMenuItem},
     notification::{Notification, NotificationType},
     status_bar::StatusBar,
-    tab::{Tab, TabBar},
     toolbar::Toolbar,
     ActiveTheme, IconName, Selectable, Sizable, StyledExt, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::{
@@ -51,6 +51,8 @@ actions!(
         LearnTitle,
         BlockForeground,
         ToggleTop,
+        TogglePin,
+        ToggleFormat,
         ZoomIn,
         ZoomOut,
         MoveBlockUp,
@@ -112,6 +114,10 @@ pub struct NxNoteApp {
     focus: FocusHandle,
     replacing: bool,
     tab_drop: Option<(OpenTab, bool)>,
+    settings_window: Option<AnyWindowHandle>,
+    settings_pending: bool,
+    tabs_scroll: ScrollHandle,
+    revealed_tab: Option<OpenTab>,
 }
 
 impl NxNoteApp {
@@ -212,6 +218,10 @@ impl NxNoteApp {
             focus: cx.focus_handle(),
             replacing: false,
             tab_drop: None,
+            settings_window: None,
+            settings_pending: false,
+            tabs_scroll: ScrollHandle::new(),
+            revealed_tab: None,
         };
         // Never leave an unreachable hidden process when both recovery mechanisms failed.
         if hidden && app._tray.is_none() && app.hotkey.is_none() {
@@ -683,33 +693,54 @@ impl NxNoteApp {
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cfg = self.session.cfg.clone();
+        if let Some(handle) = self.settings_window.take() {
+            if handle.update(cx, |_, window, _| window.activate_window()).is_ok() {
+                self.settings_window = Some(handle);
+                return;
+            }
+        }
+        if self.settings_pending { return; }
+        self.settings_pending = true;
         let weak = cx.weak_entity();
         let main = Window::window_handle(window);
-        let result = crate::settings_ui::open(
-            cfg,
-            move |cfg, _, cx| {
+        // Leave both the main window and its entity update before creating a native window.
+        gpui_kit::App::defer(cx, move |cx| {
+            let Some(owner) = weak.upgrade() else { return; };
+            let cfg = owner.update(cx, |app, _| {
+                app.settings_pending = false;
+                app.session.cfg.clone()
+            });
+            let apply_owner = weak.clone();
+            let result = crate::settings_ui::open(cfg, move |cfg, _, cx| {
                 main.update(cx, |_, window, cx| {
-                    weak.upgrade()
-                        .map(|view| view.update(cx, |app, cx| app.apply_config(cfg, window, cx)))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
-            },
-            cx,
-        );
-        match result {
-            Ok(view) => {
-                cx.observe_release_in(&view, window, |app, _, window, cx| {
-                    if !app.hidden {
-                        window.activate_window();
-                        app.editor.update(cx, |state, cx| state.focus(window, cx));
-                    }
-                })
-                .detach();
+                    apply_owner.update(cx, |app, cx| app.apply_config(cfg, window, cx)).unwrap_or(false)
+                }).unwrap_or(false)
+            }, cx);
+            match result {
+                Ok((handle, view)) => {
+                    owner.update(cx, |app, _| app.settings_window = Some(handle));
+                    gpui_kit::App::observe_release(cx, &view, move |_, cx| {
+                        cx.defer(move |cx| {
+                            let _ = main.update(cx, |_, window, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    if app.settings_window.map(|w| w.window_id()) != Some(handle.window_id()) { return; }
+                                    app.settings_window = None;
+                                    if !app.hidden {
+                                        window.activate_window();
+                                        app.editor.update(cx, |state, cx| state.focus(window, cx));
+                                    }
+                                });
+                            });
+                        });
+                    }).detach();
+                }
+                Err(error) => {
+                    let _ = main.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |app, cx| app.error(error, window, cx));
+                    });
+                }
             }
-            Err(e) => self.error(e, window, cx),
-        }
+        });
     }
 
     fn apply_config(
@@ -816,64 +847,82 @@ impl Render for NxNoteApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_size = cx.theme().font_size;
         _window.set_rem_size(ui_size);
-        let label = format!(
-            "{} / {}",
-            self.session.display_name(&self.session.current.folder_key),
-            self.session.label(&self.session.current)
-        );
-        let toolbar = Toolbar::new("note-toolbar")
-            .small()
-            .child(
-                Button::new("pin")
-                    .icon(IconName::FileText)
-                    .selected(self.session.pinned)
-                    .tooltip("钉住当前笔记")
-                    .on_click(cx.listener(|app, _, _, cx| {
-                        app.session.pinned = !app.session.pinned;
-                        cx.notify();
-                    })),
-            )
-            .content(
-                Button::new("note-menu")
-                    .ghost()
-                    .small()
-                    .text_size(ui_size)
-                    .label(label)
-                    .tooltip("笔记操作")
-                    .dropdown_menu(move |menu, _, _| {
-                        menu.menu("切换笔记…", Box::new(QuickSwitch))
-                            .separator()
-                            .menu("新建笔记", Box::new(NewNote))
-                            .menu("重命名", Box::new(RenameNote))
-                            .menu("删除当前笔记", Box::new(DeleteNote))
-                            .separator()
-                            .menu("学习标题规则…", Box::new(LearnTitle))
-                            .menu("拉黑前台应用", Box::new(BlockForeground))
-                            .separator()
-                            .menu("窗口置顶", Box::new(ToggleTop))
-                            .menu("退出", Box::new(Quit))
-                    }),
-            )
-            .content(div().flex_1())
-            .child(
-                Button::new("settings")
-                    .icon(IconName::Settings)
-                    .tooltip("设置")
-                    .on_click(cx.listener(|app, _, window, cx| app.open_settings(window, cx))),
-            );
-        let tabs = TabBar::new("note-tabs")
-            .large()
-            .selected_index(self.session.active_tab)
-            .menu(true)
-            .max_width(px(150.))
-            .on_click(cx.listener(|app, index, window, cx| app.activate_tab(*index, window, cx)))
+        let metrics = theme::LayoutMetrics::from_app(cx);
+        let control_height = metrics.control_height();
+        let compact = _window.viewport_size().width < metrics.ui(480.);
+        let label = format!("{} / {}", self.session.display_name(&self.session.current.folder_key), self.session.label(&self.session.current));
+        let note_actions = Toolbar::new("note-actions").with_size(control_height)
+            .h(metrics.tab_height()).p_0().text_size(ui_size).flex_shrink_0().gap(metrics.ui(2.))
+            .when(!compact, |toolbar| toolbar.child(Button::new("pin").icon(IconName::FileText)
+                .selected(self.session.pinned).tooltip("钉住当前笔记")
+                .on_click(cx.listener(|app, _, _, cx| { app.session.pinned = !app.session.pinned; cx.notify(); }))))
+            .content(Button::new("note-menu").ghost().with_size(control_height).icon(IconName::ChevronDown)
+                .h(control_height).text_size(ui_size).max_w(metrics.ui(140.))
+                .when(!compact, |button| button.label(self.session.display_name(&self.session.current.folder_key)))
+                .tooltip(format!("笔记操作 · {label}"))
+                .dropdown_menu(move |menu, _, _| {
+                    menu.menu("切换笔记…", Box::new(QuickSwitch)).separator()
+                        .menu("新建笔记", Box::new(NewNote)).menu("重命名", Box::new(RenameNote))
+                        .menu("删除当前笔记", Box::new(DeleteNote)).separator()
+                        .menu("学习标题规则…", Box::new(LearnTitle)).menu("拉黑前台应用", Box::new(BlockForeground))
+                        .separator().menu("钉住 / 取消钉住当前笔记", Box::new(TogglePin))
+                        .menu("展开 / 收起格式工具", Box::new(ToggleFormat))
+                        .menu("设置…", Box::new(Settings)).menu("窗口置顶", Box::new(ToggleTop)).menu("退出", Box::new(Quit))
+                }));
+        let editor_actions = Toolbar::new("editor-actions").with_size(control_height)
+            .h(metrics.tab_height()).p_0().text_size(ui_size).flex_shrink_0().gap(metrics.ui(2.))
+            .when(!compact, |toolbar| toolbar.child(Button::new("format-tools").label("Aa").h(control_height).text_size(ui_size)
+                .selected(self.editor.read(cx).format_tools_visible()).tooltip("展开 / 收起格式工具")
+                .on_mouse_down(MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
+                .on_click(cx.listener(|app, _, _, cx| {
+                    app.editor.update(cx, |editor, cx| editor.toggle_format_tools(cx)); cx.notify();
+                }))))
+            .child(Button::new("settings").icon(IconName::Settings).tooltip("设置")
+                .on_click(cx.listener(|app, _, window, cx| app.open_settings(window, cx))));
+        let menu_tabs: Vec<_> = self.session.tabs.iter().enumerate()
+            .map(|(index, tab)| (tab.clone(), self.session.label(tab), index == self.session.active_tab)).collect();
+        let menu_owner = cx.weak_entity();
+        let overflow = Button::new("all-note-tabs").ghost().with_size(control_height)
+            .icon(IconName::ChevronDown).tooltip("所有已打开的笔记")
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.scrollable(true);
+                for (target, label, selected) in &menu_tabs {
+                    let target = target.clone();
+                    let owner = menu_owner.clone();
+                    menu = menu.item(PopupMenuItem::new(label.clone()).checked(*selected)
+                        .on_click(move |_, window, cx| {
+                            let _ = owner.update(cx, |app, cx| {
+                                if let Some(index) = app.session.tabs.iter().position(|tab| tab == &target) {
+                                    app.activate_tab(index, window, cx);
+                                }
+                            });
+                        }));
+                }
+                menu
+            });
+        if self.revealed_tab.as_ref() != Some(&self.session.current) {
+            self.tabs_scroll.scroll_to_item(self.session.active_tab);
+            self.revealed_tab = Some(self.session.current.clone());
+        }
+        let tabs = div().id("note-tabs").role(Role::TabList)
+            .flex().flex_1().min_w_0().h(metrics.tab_height())
+            .overflow_x_scroll().lock_scroll_axis().track_scroll(&self.tabs_scroll)
             .children(self.session.tabs.iter().enumerate().map(|(index, tab)| {
                 let target = tab.clone();
                 let move_target = target.clone();
                 let drag = DragNoteTab { tab: tab.clone(), label: self.session.label(tab).into() };
                 let drop_after = self.tab_drop.as_ref().filter(|(candidate, _)| candidate == tab).is_some_and(|(_, after)| *after);
                 let drag_owner = cx.weak_entity();
-                Tab::new().label(self.session.label(tab)).text_size(ui_size)
+                let selected = index == self.session.active_tab;
+                gpui_kit::base::Tab::new(("note-tab", index)).selected(selected)
+                    .accessibility_label(self.session.label(tab)).set_position(index + 1, self.session.tabs.len())
+                    .h(metrics.tab_height()).px(metrics.ui(8.)).gap(metrics.ui(6.))
+                    .flex_shrink_0().max_w(metrics.ui(160.)).min_w_0().text_size(ui_size)
+                    .text_color(if selected { cx.theme().foreground } else { cx.theme().muted_foreground })
+                    .bg(if selected { cx.theme().background } else { cx.theme().tab_bar })
+                    .border_r_1().border_color(cx.theme().border.opacity(0.5))
+                    .hover(|style| style.bg(cx.theme().accent))
+                    .on_click(cx.listener(move |app, _, window, cx| app.activate_tab(index, window, cx)))
                     .on_drag(drag, move |drag, _, _, cx| {
                         cx.stop_propagation();
                         if let Some(owner) = drag_owner.upgrade() { owner.update(cx, |app, _| app.tab_drop = None); }
@@ -889,13 +938,19 @@ impl Render for NxNoteApp {
                         if drop_after { style.border_r_2().border_l_0() } else { style.border_l_2().border_r_0() }
                     })
                     .on_drop(cx.listener(move |app, drag: &DragNoteTab, window, cx| app.drop_tab(drag, &target, window, cx)))
-                    .suffix(Button::new(("close-tab", index)).ghost().xsmall().icon(IconName::Close)
+                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(self.session.label(tab)))
+                    .child(Button::new(("close-tab", index)).ghost().with_size(metrics.ui(20.).max(px(18.))).icon(IconName::Close)
                         .tooltip("关闭标签")
                         .on_mouse_down(MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
                         .on_click(cx.listener(move |app, _, window, cx| {
                             cx.stop_propagation(); app.close_tab(index, window, cx);
                         })))
             }));
+        let tab_strip = div().relative().flex().flex_1().min_w_0().h(metrics.tab_height())
+            .child(tabs).child(gpui_kit::base::ScrollableMask::vertical_wheel(&self.tabs_scroll));
+        let document_bar = div().flex().items_center().w_full().min_w_0().flex_shrink_0()
+            .h(metrics.tab_height()).bg(cx.theme().tab_bar).border_b_1().border_color(cx.theme().border)
+            .child(note_actions).child(tab_strip).child(overflow).child(editor_actions);
         let body = div()
             .flex_1()
             .min_h_0()
@@ -903,12 +958,18 @@ impl Render for NxNoteApp {
         let status_detail = format!("{} 字", self.session.text.chars().count());
         let status = StatusBar::new()
             .text_size(ui_size)
+            .py(metrics.ui(2.)).flex_shrink_0()
             .left(self.status.clone())
             .right(status_detail);
+        let toggle_format = cx.listener(|app: &mut Self, _: &ToggleFormat, _, cx| {
+            app.editor.update(cx, |editor, cx| editor.toggle_format_tools(cx)); cx.notify();
+        });
         let title_visible = !self.session.cfg.autohide_title_bar || self.title_hover;
         div()
             .id("nxnote-main")
             .key_context("NxNote")
+            .on_action(cx.listener(|app, _: &TogglePin, _, cx| { app.session.pinned = !app.session.pinned; cx.notify(); }))
+            .on_action(toggle_format)
             .track_focus(&self.focus)
             .v_flex()
             .size_full()
@@ -982,9 +1043,8 @@ impl Render for NxNoteApp {
                         ))
                     })
                     .when(!title_visible, |header| header.child(div().h(px(3.))))
-                    .child(toolbar),
+                    .child(document_bar),
             )
-            .child(tabs)
             .child(body)
             .child(status)
     }

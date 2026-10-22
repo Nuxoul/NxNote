@@ -13,9 +13,30 @@ pub enum ThemeMode {
 /// Read-only presentation settings; never an editor document or save snapshot.
 pub struct EditorTypography {
     pub line_height: f32,
+    pub paragraph_spacing: u16,
     pub colors: MdColors,
 }
 impl gpui_kit::Global for EditorTypography {}
+
+/// Compact UI spacing scales with UI text; document spacing scales with body text.
+#[derive(Clone, Copy)]
+pub struct LayoutMetrics {
+    ui_scale: f32,
+    body_scale: f32,
+}
+impl LayoutMetrics {
+    pub fn from_app(cx: &App) -> Self {
+        let theme = Theme::global(cx);
+        Self {
+            ui_scale: f32::from(theme.font_size) / 16.,
+            body_scale: f32::from(theme.mono_font_size) / 16.,
+        }
+    }
+    pub fn ui(self, base: f32) -> gpui_kit::Pixels { px(base * self.ui_scale) }
+    pub fn body(self, base: f32) -> gpui_kit::Pixels { px(base * self.body_scale) }
+    pub fn control_height(self) -> gpui_kit::Pixels { self.ui(24.).max(px(22.)) }
+    pub fn tab_height(self) -> gpui_kit::Pixels { self.ui(28.).max(px(24.)) }
+}
 
 pub fn apply(cfg: &Config, window: Option<&mut Window>, cx: &mut App) {
     match cfg.theme_mode {
@@ -60,6 +81,7 @@ pub fn apply(cfg: &Config, window: Option<&mut Window>, cx: &mut App) {
     let dark = Theme::global(cx).is_dark();
     cx.set_global(EditorTypography {
         line_height: crate::config::normalize_line_height(cfg.line_height),
+        paragraph_spacing: cfg.paragraph_spacing.min(crate::config::MAX_PARAGRAPH_SPACING),
         colors: if dark { cfg.md_dark.clone() } else { cfg.md_light.clone() },
     });
 }
@@ -70,6 +92,8 @@ pub fn document_style(cx: &App) -> gpui_kit::base::TextViewStyle {
     let colors = cx.try_global::<EditorTypography>().map(|t| t.colors.clone())
         .unwrap_or_else(|| if theme.is_dark() { MdColors::default_dark() } else { MdColors::default_light() });
     let heading = color(colors.heading);
+    let metrics = LayoutMetrics::from_app(cx);
+    let paragraph_spacing = cx.try_global::<EditorTypography>().map_or(0, |t| t.paragraph_spacing);
     gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
         .with_foreground(color(colors.text))
         .with_muted_foreground(color(colors.quote_text))
@@ -77,8 +101,12 @@ pub fn document_style(cx: &App) -> gpui_kit::base::TextViewStyle {
         .with_selection(Palette::for_mode(theme.is_dark()).selection())
         .with_border(color(colors.quote_bar))
         .with_code_background(color(colors.code_bg))
+        // Rich paragraphs have their own spacing, not another line-height multiplier.
+        .with_paragraph_gap(gpui_kit::rems(paragraph_spacing as f32 / f32::from(theme.font_size).max(1.)))
         .with_heading(move |_| StyleRefinement::default().text_color(heading))
-        .with_code_block(StyleRefinement::default().text_color(color(colors.code_text)))
+        .with_code_block(StyleRefinement::default().text_size(theme.mono_font_size)
+            .px(metrics.body(12.)).pb(metrics.body(12.)).border_0()
+            .text_color(color(colors.code_text)))
         .with_inline_code(HighlightStyle { color: Some(color(colors.code_text)), background_color: Some(color(colors.code_bg)), ..Default::default() })
         .with_table_head(StyleRefinement::default().bg(theme.colors.title_bar).text_color(theme.colors.foreground))
 }

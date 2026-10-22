@@ -7,6 +7,7 @@ use gpui_kit::component::{
     notification::{Notification, NotificationType},
     ActiveTheme, Sizable, StyledExt, WindowExt,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use markdown_editor::{BlockEditor, BlockEditorEvent, BlockEditorState, BlockKind,
     ClipboardPolicy, EditorCommand, MarkKind, PasteRequest};
@@ -24,6 +25,7 @@ pub struct NoteEditor {
     attachment_error: Option<String>,
     paste_task: Option<Task<()>>,
     paste_pending: bool,
+    format_tools_visible: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<InputEvent> for NoteEditor {}
@@ -69,6 +71,7 @@ impl NoteEditor {
         };
         Self { state, scroll, committed: text.to_string().into(), original: text.to_string().into(),
             baseline, revision, attachments, attachment_error, paste_task: None, paste_pending: false,
+            format_tools_visible: false,
             _subscriptions: vec![events, observer, typography_observer] }
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
@@ -81,6 +84,11 @@ impl NoteEditor {
         if value != self.committed { self.committed = value; cx.emit(InputEvent::Change); }
     }
     pub fn value(&self) -> SharedString { self.committed.clone() }
+    pub fn format_tools_visible(&self) -> bool { self.format_tools_visible }
+    pub fn toggle_format_tools(&mut self, cx: &mut Context<Self>) {
+        self.format_tools_visible = !self.format_tools_visible;
+        cx.notify();
+    }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) { self.state.focus_handle(cx).focus(window, cx); }
     pub fn select_end(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| { let _ = state.select_end(cx); });
@@ -180,7 +188,8 @@ impl NoteEditor {
         }));
     }
     fn tool(&self, id: &'static str, label: &'static str, command: EditorCommand, cx: &mut Context<Self>) -> Button {
-        Button::new(id).ghost().small().label(label)
+        let height = crate::theme::LayoutMetrics::from_app(cx).control_height();
+        Button::new(id).ghost().with_size(height).h(height).text_size(cx.theme().font_size).label(label)
             .on_mouse_down(MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
             .on_click(cx.listener(move |this, _, window, cx| this.command(command.clone(), window, cx)))
     }
@@ -191,8 +200,11 @@ impl Render for NoteEditor {
             .map_or(1.5, |typography| typography.line_height);
         let text_style = crate::theme::document_style(cx);
         let foreground = text_style.foreground();
+        let metrics = crate::theme::LayoutMetrics::from_app(cx);
         div().v_flex().size_full().min_h_0().key_context("NxNoteEditor")
-            .child(div().flex().flex_wrap().gap_1().p_1().bg(cx.theme().title_bar).border_b_1().border_color(cx.theme().border)
+            .when(self.format_tools_visible, |root| root.child(div().flex().flex_wrap()
+                .gap(metrics.ui(4.)).p(metrics.ui(4.)).flex_shrink_0()
+                .bg(cx.theme().title_bar).border_b_1().border_color(cx.theme().border)
                 .child(self.tool("b", "B", EditorCommand::ToggleMark(MarkKind::Bold), cx))
                 .child(self.tool("i", "I", EditorCommand::ToggleMark(MarkKind::Italic), cx))
                 .child(self.tool("p", "正文", EditorCommand::SetBlockKind(BlockKind::Paragraph), cx))
@@ -201,11 +213,11 @@ impl Render for NoteEditor {
                 .child(self.tool("ul", "列表", EditorCommand::ToggleList { ordered: false }, cx))
                 .child(self.tool("task", "待办", EditorCommand::ToggleTask, cx))
                 .child(self.tool("code", "代码", EditorCommand::SetCodeBlock { lang: None }, cx))
-                .child(self.tool("table", "表格", EditorCommand::InsertTable { rows: 3, cols: 3 }, cx)))
+                .child(self.tool("table", "表格", EditorCommand::InsertTable { rows: 3, cols: 3 }, cx))))
             .child(div().id("block-editor-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().track_scroll(&self.scroll)
-                .font_family(cx.theme().mono_font_family.clone()).text_size(cx.theme().mono_font_size)
+                .font_family(cx.theme().mono_font_family.clone()).font_weight(FontWeight::NORMAL).text_size(cx.theme().mono_font_size)
                 .text_color(foreground)
                 .child(BlockEditor::new(&self.state).text_style(text_style).line_height(relative(line_height))
-                    .line_numbers(true).min_h_full().py_3().pr_3().pl_0()))
+                    .line_numbers(true).min_h_full().py(metrics.body(8.)).pr(metrics.body(12.)).pl_0()))
     }
 }

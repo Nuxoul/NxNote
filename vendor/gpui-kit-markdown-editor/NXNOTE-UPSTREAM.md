@@ -32,3 +32,21 @@ reused. No document, input, history or paragraph-gap rules are changed.
 Selection decorations split text/backgrounds from inline-atom overlays: text keeps
 the host selection color, atom overlays use 40% alpha to leave images visible.
 The gutter now reads semantic surface/border/text roles from the shared theme.
+
+NxNote compact-chrome pass: gutter paints the document background instead of a
+contrasting secondary lane; the one-device-pixel divider uses 55% border alpha,
+inactive numbers 80% muted alpha and the active number the foreground. Fixed
+allocation, full-height coverage, native positions and editing semantics remain.
+This is a host-specific presentation choice, not code copied from Zed. The unused
+style parameter is marked intentionally unused; signature/callers are unchanged.
+
+Insertion caret geometry now uses the rendered leaf line height instead of font
+ascent + descent. Its top is the native line origin, without glyph-height centering;
+painting, reveal and IME bounds share FrameLayout::caret_bounds. Existing device
+pixel snapping remains. This supports the host's 0.5–2.5 line-height range without
+introducing a separate caret/input geometry model.
+
+Paragraph spacing is now a separate host setting. Include the resolved paragraph
+gap in the culling geometry key, so changing only that setting drops cached block
+heights and schedules fresh measurement without a document/history mutation.
+The host defaults the extra gap to zero; font line-height remains independent.

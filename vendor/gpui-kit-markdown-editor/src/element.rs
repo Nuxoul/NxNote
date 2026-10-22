@@ -469,6 +469,7 @@ impl RenderOnce for BlockEditor {
                 content_bounds,
                 padding: root_style.padding,
                 typography,
+                paragraph_gap: text_style.paragraph_gap().to_pixels(window.rem_size()),
                 caret_was_visible,
                 gutter_width,
                 backgrounds: Some(backgrounds),
@@ -489,6 +490,7 @@ struct EditorRoot {
     content_bounds: Rc<Cell<Bounds<Pixels>>>,
     padding: Edges<DefiniteLength>,
     typography: TextStyle,
+    paragraph_gap: Pixels,
     caret_was_visible: bool,
     gutter_width: Pixels,
 }
@@ -620,6 +622,7 @@ impl Element for EditorRoot {
                 content.size.width,
                 window.rem_size(),
                 &self.typography,
+                self.paragraph_gap,
             );
             // Retain a visible caret or an existing reveal request, but do not
             // interrupt manual scrolling. Wait for fresh spacer positions.

@@ -119,6 +119,9 @@ pub struct Config {
     /// Body line-box height as a font-size multiplier; independent of paragraph gaps.
     #[serde(default = "default_line_height")]
     pub line_height: f32,
+    /// Extra spacing after ordinary Markdown blocks, in logical pixels.
+    #[serde(default)]
+    pub paragraph_spacing: u16,
     pub hotkey: String,
     /// 剪贴板快速捕获热键：按下后把剪贴板文本追加进速记本
     #[serde(default = "default_hotkey_capture")]
@@ -156,8 +159,9 @@ pub struct Config {
 }
 
 fn default_ui_font_size() -> u16 { 16 }
-pub const MIN_LINE_HEIGHT: f32 = 1.;
+pub const MIN_LINE_HEIGHT: f32 = 0.5;
 pub const MAX_LINE_HEIGHT: f32 = 2.5;
+pub const MAX_PARAGRAPH_SPACING: u16 = 48;
 fn default_line_height() -> f32 { 1.5 }
 pub fn normalize_line_height(value: f32) -> f32 {
     if value.is_finite() {
@@ -192,6 +196,7 @@ impl Default for Config {
             font_size: 13.0,
             ui_font_size: default_ui_font_size(),
             line_height: default_line_height(),
+            paragraph_spacing: 0,
             hotkey: "Ctrl+Alt+N".to_string(),
             hotkey_capture: default_hotkey_capture(),
             autosave_delay_ms: 1500,
@@ -220,6 +225,7 @@ impl Config {
                 cfg.font_size = if cfg.font_size.is_finite() { cfg.font_size.round().clamp(10., 24.) } else { 13. };
                 cfg.ui_font_size = cfg.ui_font_size.clamp(10, 24);
                 cfg.line_height = normalize_line_height(cfg.line_height);
+                cfg.paragraph_spacing = cfg.paragraph_spacing.min(MAX_PARAGRAPH_SPACING);
                 MdColors::migrate_factory_palettes(&mut cfg.md_dark, &mut cfg.md_light);
                 cfg
             }
@@ -259,6 +265,7 @@ poll_interval_ms = 500
         assert_eq!(cfg.hotkey_capture, "Ctrl+Alt+Shift+C");
         assert_eq!(cfg.md_dark, MdColors::default_dark());
         assert_eq!(cfg.line_height, default_line_height());
+        assert_eq!(cfg.paragraph_spacing, 0);
     }
     #[test]
     fn config_roundtrip_preserves_paths_tabs_and_colors() {
@@ -272,15 +279,19 @@ poll_interval_ms = 500
         });
         cfg.md_dark.heading = [1, 2, 3];
         cfg.line_height = 1.8;
+        cfg.paragraph_spacing = 8;
         let restored: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert_eq!(restored.ui_fonts, cfg.ui_fonts);
         assert_eq!(restored.open_tabs, cfg.open_tabs);
         assert_eq!(restored.md_dark, cfg.md_dark);
         assert_eq!(restored.line_height, 1.8);
+        assert_eq!(restored.paragraph_spacing, 8);
     }
     #[test]
     fn line_height_normalization_is_bounded_and_finite() {
-        assert_eq!(normalize_line_height(0.5), 1.);
+        assert_eq!(normalize_line_height(0.5), 0.5);
+        assert_eq!(normalize_line_height(0.1), 0.5);
+        assert_eq!(normalize_line_height(0.76), 0.8);
         assert_eq!(normalize_line_height(3.), 2.5);
         assert_eq!(normalize_line_height(1.84), 1.8);
         assert_eq!(normalize_line_height(f32::NAN), 1.5);

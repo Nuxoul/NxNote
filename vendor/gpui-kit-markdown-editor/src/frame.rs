@@ -89,10 +89,9 @@ impl LeafGeom {
         self.geometry.line_height()
     }
 
-    /// Height of the caret: the font's ascent + descent (like a text
-    /// input's caret), not the whole line box, which includes leading.
+    /// Match the insertion caret to the rendered line box, including leading.
     pub(crate) fn caret_height(&self) -> Pixels {
-        self.geometry.caret_height()
+        self.line_height()
     }
 
     /// Rendered index for a model offset.
@@ -158,11 +157,7 @@ impl FrameLayout {
 
     pub(crate) fn caret_bounds(&self, pos: BlockPosition, width: Pixels) -> Option<Bounds<Pixels>> {
         let leaf = self.leaf(pos.block)?;
-        let (line, h) = (leaf.line_height(), leaf.caret_height());
-        let mut origin = leaf.caret_point(pos.offset);
-        // GPUI centres the glyphs in the line box: so does the caret.
-        origin.y += (line - h) / 2.;
-        Some(Bounds::new(origin, size(width, h)))
+        Some(Bounds::new(leaf.caret_point(pos.offset), size(width, leaf.caret_height())))
     }
 
     /// The table under a window point.
