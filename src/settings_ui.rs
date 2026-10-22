@@ -11,7 +11,7 @@ use gpui_kit::component::{
     searchable_list::{SearchableListItem, SearchableVec},
     switch::Switch,
     tab::{Tab, TabBar},
-    ActiveTheme as _, IndexPath as ComponentIndexPath, TitleBar, WindowExt as _,
+    ActiveTheme as _, StyledExt as _, IndexPath as ComponentIndexPath, TitleBar, WindowExt as _,
 };
 use gpui_kit::{
     div, prelude::*, px, size, App, Bounds, Context, Entity, Hsla, IntoElement, Render, Rgba,
@@ -69,6 +69,7 @@ pub struct SettingsView {
     tab: usize,
     font_size: Entity<InputState>,
     ui_font_size: Entity<InputState>,
+    line_height: Entity<InputState>,
     window_width: Entity<InputState>,
     window_height: Entity<InputState>,
     autosave_delay: Entity<InputState>,
@@ -122,6 +123,10 @@ impl SettingsView {
     ) -> Self {
         let font_size = integer_font_state(draft.font_size.round(), window, cx);
         let ui_font_size = integer_font_state(draft.ui_font_size as f32, window, cx);
+        let line_height = cx.new(|cx| InputState::new(window, cx)
+            .default_value(format!("{:.1}", crate::config::normalize_line_height(draft.line_height)))
+            .step(0.1).min(crate::config::MIN_LINE_HEIGHT as f64).max(crate::config::MAX_LINE_HEIGHT as f64)
+            .mask_pattern(gpui_kit::base::input::MaskPattern::Number { separator: None, fraction: Some(1) }));
         let window_width = number_state(draft.window_width as f64, 220., 1600., 1., window, cx);
         let window_height = number_state(draft.window_height as f64, 200., 1600., 1., window, cx);
         let autosave_delay = number_state(
@@ -151,6 +156,7 @@ impl SettingsView {
         for state in [
             &font_size,
             &ui_font_size,
+            &line_height,
             &window_width,
             &window_height,
             &autosave_delay,
@@ -229,6 +235,7 @@ impl SettingsView {
             tab: 0,
             font_size,
             ui_font_size,
+            line_height,
             window_width,
             window_height,
             autosave_delay,
@@ -278,6 +285,10 @@ impl SettingsView {
     fn collected_config(&self, cx: &App) -> anyhow::Result<Config> {
         let font_size = read_font_size(&self.font_size, "正文字号", cx)?;
         let ui_font_size = read_font_size(&self.ui_font_size, "界面字号", cx)? as u16;
+        let line_height = crate::config::normalize_line_height(read_number(
+            &self.line_height, "正文行间距", crate::config::MIN_LINE_HEIGHT as f64,
+            crate::config::MAX_LINE_HEIGHT as f64, cx,
+        )? as f32);
         let window_width = read_number(&self.window_width, "默认宽度", 220., 1600., cx)? as f32;
         let window_height = read_number(&self.window_height, "默认高度", 200., 1600., cx)? as f32;
         let autosave_delay_ms =
@@ -312,6 +323,7 @@ impl SettingsView {
         let mut config = self.draft.clone();
         config.font_size = font_size;
         config.ui_font_size = ui_font_size;
+        config.line_height = line_height;
         config.window_width = window_width;
         config.window_height = window_height;
         config.autosave_delay_ms = autosave_delay_ms;
@@ -367,6 +379,12 @@ impl SettingsView {
                     .label("正文字号")
                     .description("笔记正文及 Markdown 排版基准，整数 10–24 px")
                     .child(NumberInput::new(&self.font_size).suffix("px")),
+            )
+            .child(
+                Field::new()
+                    .label("正文行间距")
+                    .description("行高为字号的 1.0–2.5 倍，步长 0.1；默认 1.5，不改变段落间距")
+                    .child(NumberInput::new(&self.line_height).suffix("倍")),
             )
             .child(
                 Field::new()
@@ -504,15 +522,26 @@ impl SettingsView {
             ))
     }
 
-    fn render_colors(&self) -> impl IntoElement {
+    fn render_colors(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = color_form("深色主题 Markdown 颜色", &self.dark_colors);
         let light = color_form("浅色主题 Markdown 颜色", &self.light_colors);
-        div()
-            .flex()
-            .gap_6()
-            .items_start()
-            .child(div().flex_1().min_w_0().child(dark))
-            .child(div().flex_1().min_w_0().child(light))
+        div().v_flex().gap_4()
+            .child(div().flex().items_center().justify_between().gap_3()
+                .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("选区、焦点与控件状态统一使用主题蓝；恢复默认后需点击应用。"))
+                .child(Button::new("reset-document-colors").label("恢复新版默认配色")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        for (state, rgb) in this.dark_colors.iter().zip(md_color_values(&MdColors::default_dark())) {
+                            state.update(cx, |state, cx| state.set_value(rgb_to_hsla(rgb), window, cx));
+                        }
+                        for (state, rgb) in this.light_colors.iter().zip(md_color_values(&MdColors::default_light())) {
+                            state.update(cx, |state, cx| state.set_value(rgb_to_hsla(rgb), window, cx));
+                        }
+                        cx.notify();
+                    }))))
+            .child(div().flex().gap_6().items_start()
+                .child(div().flex_1().min_w_0().child(dark))
+                .child(div().flex_1().min_w_0().child(light)))
     }
 }
 
@@ -523,7 +552,7 @@ impl Render for SettingsView {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_behavior(cx).into_any_element(),
             2 => self.render_hotkeys().into_any_element(),
-            _ => self.render_colors().into_any_element(),
+            _ => self.render_colors(cx).into_any_element(),
         };
 
         div()

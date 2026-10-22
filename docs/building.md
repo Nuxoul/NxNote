@@ -25,13 +25,13 @@ cargo run --locked -- --data-dir .\test-data
 
 ## 当前单文件（2026-10-22）
 
-- 文件：`dist/NxNote-v0.2.1-block-editor-20261022-103726-windows-x64.exe`
-- 大小：22,796,288 字节。
-- SHA-256：`17997EF88BA6FD01AABB4B1EBE93C3D173E508EA64A50ADA117D9359E8572719`
-- 构建：`cargo build --locked --offline --release --target-dir target\single-file-fixes` 成功，耗时 3m41s，无编译错误或 warning。
+- 文件：`dist/NxNote-v0.2.1-themes-20261022-125634-windows-x64.exe`
+- 大小：22,892,032 字节。
+- SHA-256：`821576BA913160CD33EC47BE72C46288E29BC14B060E97E66FA5CE0DDEBC72A8`
+- 构建成功，耗时 2m06s；无编译错误，存在一条 gutter 未使用 `style` 参数的 warning。
 - 已检查 x64 / Windows GUI、直接导入仅 Windows 系统 DLL、复制前后 SHA-256 一致。未覆盖旧包。
 - 默认使用正式 `NxNote` 数据目录，或显式 `--data-dir` 指定的目录，不注入对比示例、不自动迁移 A/B 测试数据。
-- 未执行测试、未启动程序或进行桌面自动化；Windows IME、Markdown 往返与实际交互仍待用户验收。
+- 包含浅/深色全局配色、正文样式和选区重设计、恢复默认配色入口，以及此前行间距与行号修复。未执行测试、未启动程序或桌面自动化；实际颜色、选区与主题切换待用户验收。
 
 
 ## 现有 A 效果包（历史产物）
@@ -40,8 +40,8 @@ cargo run --locked -- --data-dir .\test-data
 - 大小：22,801,920 字节。
 - SHA-256：`A2E42690C9F2EA6747CE711E940C5531E326C673EC8CA9DADF38F5C2EB106E9F`
 - 该包此前实际通过 Release 编译和 PE / 系统 DLL 检查，但没有由代理启动或执行测试。
-- 它仍是对比时的产物：默认使用 `NxNote-BlockEditor-Preview` 独立目录。当前源码清理不会修改它，也不表示已有正式目录版新包。
+- 它仍是对比时的产物：默认使用 `NxNote-BlockEditor-Preview` 独立目录。当前源码与新包不会修改它。
 
 ## 本轮验证边界
 
-项目清理阶段完成源码语法、Cargo metadata/依赖图和文件引用检查；随后按本次请求完成上述 Release 编译、单文件及文件检查，并准备提交源码文档、正常推送 main。A 上游测试源码与现有有效应用测试保留但未执行；EXE、ZIP 和构建产物不提交到远端。
+本轮完成 Release 编译、单文件及文件检查；未执行测试、启动、提交或推送。此前源码已在 95ef0a0 推送，后续行号、行间距及主题改动尚未提交。EXE、ZIP 和构建产物不提交到远端。

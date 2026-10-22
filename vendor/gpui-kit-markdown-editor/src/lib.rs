@@ -47,6 +47,7 @@ mod document;
 mod editor;
 mod element;
 mod frame;
+mod gutter;
 mod host;
 mod id;
 mod import;

@@ -900,7 +900,7 @@ impl Render for NxNoteApp {
             .flex_1()
             .min_h_0()
             .child(self.editor.clone());
-        let status_detail = format!("{} 字 · Markdown 块编辑", self.session.text.chars().count());
+        let status_detail = format!("{} 字", self.session.text.chars().count());
         let status = StatusBar::new()
             .text_size(ui_size)
             .left(self.status.clone())

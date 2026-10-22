@@ -42,6 +42,8 @@ pub(crate) struct Snapshot {
     pub(crate) leaves: Rc<Vec<LeafInfo>>,
     /// Tables and their keyed cells, for node selection (no caret in cells).
     pub(crate) tables: Rc<Vec<(BlockId, Vec<BlockId>)>>,
+    /// Full-document index remains stable when off-screen blocks are culled.
+    pub(crate) line_numbers: Rc<super::gutter::LineNumbers>,
 }
 
 #[derive(Default)]
@@ -105,6 +107,7 @@ impl ProjectionCache {
             blocks,
             leaves: Rc::new(leaves),
             tables: Rc::new(tables),
+            line_numbers: Rc::new(super::gutter::LineNumbers::new(doc)),
         });
         self.revision = Some(doc.revision);
         self.snapshot.clone()

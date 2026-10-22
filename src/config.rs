@@ -21,33 +21,48 @@ pub struct MdColors {
 impl MdColors {
     pub fn default_dark() -> Self {
         Self {
-            text: [216, 210, 196],
-            heading: [245, 175, 90],
-            bold: [255, 255, 255],
-            italic: [245, 175, 90],
-            code_text: [245, 180, 110],
-            code_bg: [52, 36, 22],
-            link: [120, 200, 220],
-            quote_text: [140, 170, 200],
-            quote_bar: [110, 145, 180],
-            list_marker: [245, 175, 90],
-            syntax: [140, 132, 118],
+            text: [229, 234, 242],
+            heading: [241, 245, 251],
+            bold: [241, 245, 251],
+            italic: [212, 224, 239],
+            code_text: [209, 233, 222],
+            code_bg: [36, 48, 63],
+            link: [210, 230, 255],
+            quote_text: [212, 224, 239],
+            quote_bar: [125, 164, 214],
+            list_marker: [202, 220, 243],
+            syntax: [212, 224, 239],
         }
     }
     pub fn default_light() -> Self {
         Self {
-            text: [40, 36, 30],
-            heading: [178, 110, 40],
-            bold: [10, 8, 6],
-            italic: [178, 110, 40],
-            code_text: [148, 92, 42],
-            code_bg: [240, 226, 200],
-            link: [50, 110, 180],
-            quote_text: [70, 90, 130],
-            quote_bar: [110, 145, 180],
-            list_marker: [178, 110, 40],
-            syntax: [150, 140, 124],
+            text: [32, 43, 60],
+            heading: [21, 35, 57],
+            bold: [21, 35, 57],
+            italic: [67, 83, 108],
+            code_text: [30, 92, 78],
+            code_bg: [234, 240, 246],
+            link: [23, 79, 150],
+            quote_text: [58, 78, 103],
+            quote_bar: [72, 111, 164],
+            list_marker: [23, 79, 150],
+            syntax: [67, 83, 107],
         }
+    }
+    /// Only replace the exact old factory palette, never a user's edits.
+    pub fn migrate_factory_palettes(dark: &mut Self, light: &mut Self) {
+        let old_dark = Self {
+            text: [216,210,196], heading: [245,175,90], bold: [255,255,255], italic: [245,175,90],
+            code_text: [245,180,110], code_bg: [52,36,22], link: [120,200,220],
+            quote_text: [140,170,200], quote_bar: [110,145,180], list_marker: [245,175,90], syntax: [140,132,118],
+        };
+        let old_light = Self {
+            text: [40,36,30], heading: [178,110,40], bold: [10,8,6], italic: [178,110,40],
+            code_text: [148,92,42], code_bg: [240,226,200], link: [50,110,180],
+            quote_text: [70,90,130], quote_bar: [110,145,180], list_marker: [178,110,40], syntax: [150,140,124],
+        };
+        if *dark == old_dark { *dark = Self::default_dark(); }
+        if *light == old_light { *light = Self::default_light(); }
     }
 }
 
@@ -101,6 +116,9 @@ pub struct Config {
     pub font_size: f32,
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: u16,
+    /// Body line-box height as a font-size multiplier; independent of paragraph gaps.
+    #[serde(default = "default_line_height")]
+    pub line_height: f32,
     pub hotkey: String,
     /// 剪贴板快速捕获热键：按下后把剪贴板文本追加进速记本
     #[serde(default = "default_hotkey_capture")]
@@ -138,6 +156,16 @@ pub struct Config {
 }
 
 fn default_ui_font_size() -> u16 { 16 }
+pub const MIN_LINE_HEIGHT: f32 = 1.;
+pub const MAX_LINE_HEIGHT: f32 = 2.5;
+fn default_line_height() -> f32 { 1.5 }
+pub fn normalize_line_height(value: f32) -> f32 {
+    if value.is_finite() {
+        (value.clamp(MIN_LINE_HEIGHT, MAX_LINE_HEIGHT) * 10.).round() / 10.
+    } else {
+        default_line_height()
+    }
+}
 fn serialize_body_font_size<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_u16(value.round().clamp(10., 24.) as u16)
 }
@@ -163,6 +191,7 @@ impl Default for Config {
             always_on_top: false,
             font_size: 13.0,
             ui_font_size: default_ui_font_size(),
+            line_height: default_line_height(),
             hotkey: "Ctrl+Alt+N".to_string(),
             hotkey_capture: default_hotkey_capture(),
             autosave_delay_ms: 1500,
@@ -190,6 +219,8 @@ impl Config {
                 let mut cfg: Self = toml::from_str(&s).unwrap_or_default();
                 cfg.font_size = if cfg.font_size.is_finite() { cfg.font_size.round().clamp(10., 24.) } else { 13. };
                 cfg.ui_font_size = cfg.ui_font_size.clamp(10, 24);
+                cfg.line_height = normalize_line_height(cfg.line_height);
+                MdColors::migrate_factory_palettes(&mut cfg.md_dark, &mut cfg.md_light);
                 cfg
             }
             Err(_) => {
@@ -227,6 +258,7 @@ poll_interval_ms = 500
         assert!(cfg.close_to_tray);
         assert_eq!(cfg.hotkey_capture, "Ctrl+Alt+Shift+C");
         assert_eq!(cfg.md_dark, MdColors::default_dark());
+        assert_eq!(cfg.line_height, default_line_height());
     }
     #[test]
     fn config_roundtrip_preserves_paths_tabs_and_colors() {
@@ -239,9 +271,45 @@ poll_interval_ms = 500
             note_name: "中文🙂".into(),
         });
         cfg.md_dark.heading = [1, 2, 3];
+        cfg.line_height = 1.8;
         let restored: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert_eq!(restored.ui_fonts, cfg.ui_fonts);
         assert_eq!(restored.open_tabs, cfg.open_tabs);
         assert_eq!(restored.md_dark, cfg.md_dark);
+        assert_eq!(restored.line_height, 1.8);
+    }
+    #[test]
+    fn line_height_normalization_is_bounded_and_finite() {
+        assert_eq!(normalize_line_height(0.5), 1.);
+        assert_eq!(normalize_line_height(3.), 2.5);
+        assert_eq!(normalize_line_height(1.84), 1.8);
+        assert_eq!(normalize_line_height(f32::NAN), 1.5);
+        assert_eq!(normalize_line_height(f32::INFINITY), 1.5);
+    }
+    #[test]
+    fn factory_palette_migration_preserves_custom_colors() {
+        let mut dark = MdColors::default_dark();
+        let mut light = MdColors::default_light();
+        dark.heading = [1, 2, 3];
+        light.link = [7, 8, 9];
+        let custom = (dark.clone(), light.clone());
+        MdColors::migrate_factory_palettes(&mut dark, &mut light);
+        assert_eq!((dark, light), custom);
+    }
+    #[test]
+    fn old_factory_palettes_adopt_new_defaults() {
+        let mut dark = MdColors {
+            text: [216,210,196], heading: [245,175,90], bold: [255,255,255], italic: [245,175,90],
+            code_text: [245,180,110], code_bg: [52,36,22], link: [120,200,220],
+            quote_text: [140,170,200], quote_bar: [110,145,180], list_marker: [245,175,90], syntax: [140,132,118],
+        };
+        let mut light = MdColors {
+            text: [40,36,30], heading: [178,110,40], bold: [10,8,6], italic: [178,110,40],
+            code_text: [148,92,42], code_bg: [240,226,200], link: [50,110,180],
+            quote_text: [70,90,130], quote_bar: [110,145,180], list_marker: [178,110,40], syntax: [150,140,124],
+        };
+        MdColors::migrate_factory_palettes(&mut dark, &mut light);
+        assert_eq!(dark, MdColors::default_dark());
+        assert_eq!(light, MdColors::default_light());
     }
 }

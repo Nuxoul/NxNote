@@ -35,6 +35,7 @@ impl NoteEditor {
         let scroll = ScrollHandle::new();
         let state = cx.new(|cx| {
             let mut state = BlockEditorState::new(window, cx).with_clipboard_policy(ClipboardPolicy::Host);
+            state.set_editor_style(crate::theme::editor_style(cx), cx);
             // set_source reports failures; with_source silently discards them.
             if let Err(error) = state.set_source(text, cx) {
                 state.set_readonly(true, cx);
@@ -58,12 +59,17 @@ impl NoteEditor {
             cx.notify();
         });
         let observer = cx.observe(&state, |this, _, cx| { this.sync(cx); cx.notify(); });
+        let typography_observer = cx.observe_global::<crate::theme::EditorTypography>(|this, cx| {
+            let style = crate::theme::editor_style(cx);
+            this.state.update(cx, |state, cx| state.set_editor_style(style, cx));
+            cx.notify();
+        });
         let (attachments, attachment_error) = match Attachments::load() {
             Ok(value) => (value, None), Err(error) => (Attachments::default(), Some(error.to_string())),
         };
         Self { state, scroll, committed: text.to_string().into(), original: text.to_string().into(),
             baseline, revision, attachments, attachment_error, paste_task: None, paste_pending: false,
-            _subscriptions: vec![events, observer] }
+            _subscriptions: vec![events, observer, typography_observer] }
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
@@ -181,8 +187,12 @@ impl NoteEditor {
 }
 impl Render for NoteEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let line_height = cx.try_global::<crate::theme::EditorTypography>()
+            .map_or(1.5, |typography| typography.line_height);
+        let text_style = crate::theme::document_style(cx);
+        let foreground = text_style.foreground();
         div().v_flex().size_full().min_h_0().key_context("NxNoteEditor")
-            .child(div().flex().flex_wrap().gap_1().p_1().border_b_1().border_color(cx.theme().border)
+            .child(div().flex().flex_wrap().gap_1().p_1().bg(cx.theme().title_bar).border_b_1().border_color(cx.theme().border)
                 .child(self.tool("b", "B", EditorCommand::ToggleMark(MarkKind::Bold), cx))
                 .child(self.tool("i", "I", EditorCommand::ToggleMark(MarkKind::Italic), cx))
                 .child(self.tool("p", "正文", EditorCommand::SetBlockKind(BlockKind::Paragraph), cx))
@@ -192,10 +202,10 @@ impl Render for NoteEditor {
                 .child(self.tool("task", "待办", EditorCommand::ToggleTask, cx))
                 .child(self.tool("code", "代码", EditorCommand::SetCodeBlock { lang: None }, cx))
                 .child(self.tool("table", "表格", EditorCommand::InsertTable { rows: 3, cols: 3 }, cx)))
-            .child(div().text_size(px(11.)).px_2().py_1().text_color(cx.theme().muted_foreground)
-                .child("Markdown 块编辑 · 保存会规范化 Markdown"))
             .child(div().id("block-editor-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().track_scroll(&self.scroll)
                 .font_family(cx.theme().mono_font_family.clone()).text_size(cx.theme().mono_font_size)
-                .child(BlockEditor::new(&self.state).min_h_full().p_3()))
+                .text_color(foreground)
+                .child(BlockEditor::new(&self.state).text_style(text_style).line_height(relative(line_height))
+                    .line_numbers(true).min_h_full().py_3().pr_3().pl_0()))
     }
 }

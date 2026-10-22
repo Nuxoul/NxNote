@@ -1,6 +1,6 @@
-use crate::config::Config;
+use crate::{config::{Config, MdColors}, theme_palette::Palette};
 use gpui_kit::component::{Theme, ThemeMode as KitThemeMode};
-use gpui_kit::{px, App, Window};
+use gpui_kit::{px, App, Window, Styled, StyleRefinement, HighlightStyle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum ThemeMode {
@@ -10,32 +10,36 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// Read-only presentation settings; never an editor document or save snapshot.
+pub struct EditorTypography {
+    pub line_height: f32,
+    pub colors: MdColors,
+}
+impl gpui_kit::Global for EditorTypography {}
+
 pub fn apply(cfg: &Config, window: Option<&mut Window>, cx: &mut App) {
     match cfg.theme_mode {
         ThemeMode::System => Theme::sync_system_appearance(window, cx),
         ThemeMode::Light => Theme::change(KitThemeMode::Light, window, cx),
         ThemeMode::Dark => Theme::change(KitThemeMode::Dark, window, cx),
     }
-    let ui = cfg
-        .ui_fonts
-        .first()
-        .map(|p| crate::fonts::font_display_name(std::path::Path::new(p)));
-    let editor = cfg
-        .editor_fonts
-        .first()
-        .map(|p| crate::fonts::font_display_name(std::path::Path::new(p)));
+    let ui = cfg.ui_fonts.first().map(|p| crate::fonts::font_display_name(std::path::Path::new(p)));
+    let editor = cfg.editor_fonts.first().map(|p| crate::fonts::font_display_name(std::path::Path::new(p)));
     Theme::update(cx, |theme| {
+        let palette = Palette::for_mode(theme.is_dark());
+        palette.apply(theme);
         theme.font_family = ui.unwrap_or_else(|| "Microsoft YaHei UI".into()).into();
         theme.font_size = px(cfg.ui_font_size.clamp(10, 24) as f32);
         theme.mono_font_family = editor.unwrap_or_else(|| "Consolas".into()).into();
         theme.mono_font_size = px(cfg.font_size.round().clamp(10., 24.));
-        let colors = if theme.is_dark() {
-            &cfg.md_dark
-        } else {
-            &cfg.md_light
-        };
+        let colors = if theme.is_dark() { &cfg.md_dark } else { &cfg.md_light };
         let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.editor_background = Some(gpui_kit::rgb(palette.canvas).into());
         highlight.style.editor_foreground = Some(color(colors.text));
+        highlight.style.editor_active_line = Some(gpui_kit::rgb(palette.chrome).into());
+        highlight.style.editor_line_number = Some(gpui_kit::rgb(palette.muted).into());
+        highlight.style.editor_active_line_number = Some(gpui_kit::rgb(palette.primary).into());
+        highlight.style.editor_gutter_background = Some(gpui_kit::rgb(palette.chrome).into());
         let syntax = &mut highlight.style.syntax;
         let style = |rgb: [u8; 3], weight: u16, italic: bool| {
             serde_json::from_value(serde_json::json!({"color": color(rgb), "font_weight": weight, "font_style": if italic { "italic" } else { "normal" }})).ok()
@@ -53,6 +57,41 @@ pub fn apply(cfg: &Config, window: Option<&mut Window>, cx: &mut App) {
         syntax.comment = style(colors.quote_text, 400, false);
         theme.highlight_theme = std::sync::Arc::new(highlight);
     });
+    let dark = Theme::global(cx).is_dark();
+    cx.set_global(EditorTypography {
+        line_height: crate::config::normalize_line_height(cfg.line_height),
+        colors: if dark { cfg.md_dark.clone() } else { cfg.md_light.clone() },
+    });
+}
+
+/// Shared renderer style, so the visible document uses the same palette as UI.
+pub fn document_style(cx: &App) -> gpui_kit::base::TextViewStyle {
+    let theme = Theme::global(cx);
+    let colors = cx.try_global::<EditorTypography>().map(|t| t.colors.clone())
+        .unwrap_or_else(|| if theme.is_dark() { MdColors::default_dark() } else { MdColors::default_light() });
+    let heading = color(colors.heading);
+    gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
+        .with_foreground(color(colors.text))
+        .with_muted_foreground(color(colors.quote_text))
+        .with_link(color(colors.link))
+        .with_selection(Palette::for_mode(theme.is_dark()).selection())
+        .with_border(color(colors.quote_bar))
+        .with_code_background(color(colors.code_bg))
+        .with_heading(move |_| StyleRefinement::default().text_color(heading))
+        .with_code_block(StyleRefinement::default().text_color(color(colors.code_text)))
+        .with_inline_code(HighlightStyle { color: Some(color(colors.code_text)), background_color: Some(color(colors.code_bg)), ..Default::default() })
+        .with_table_head(StyleRefinement::default().bg(theme.colors.title_bar).text_color(theme.colors.foreground))
+}
+
+/// Explicit native caret/selection colors, refreshed only when theme changes.
+pub fn editor_style(cx: &App) -> markdown_editor::BlockEditorStyle {
+    let theme = Theme::global(cx);
+    markdown_editor::BlockEditorStyle::default()
+        .with_foreground(theme.colors.foreground)
+        .with_muted_foreground(theme.colors.muted_foreground)
+        .with_caret(theme.colors.caret)
+        .with_composition_underline(theme.colors.primary)
+        .with_selection(Palette::for_mode(theme.is_dark()).selection())
 }
 
 pub fn color([r, g, b]: [u8; 3]) -> gpui_kit::Hsla {

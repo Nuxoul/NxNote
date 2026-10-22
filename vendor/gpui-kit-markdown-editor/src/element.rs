@@ -35,6 +35,8 @@ const LIST_CHUNK: usize = 32;
 pub struct BlockEditor {
     state: Entity<BlockEditorState>,
     style: StyleRefinement,
+    line_numbers: bool,
+    text_style: Option<gpui_kit::base::TextViewStyle>,
 }
 
 impl BlockEditor {
@@ -42,7 +44,19 @@ impl BlockEditor {
         Self {
             state: state.clone(),
             style: StyleRefinement::default(),
+            line_numbers: false,
+            text_style: None,
         }
+    }
+    /// Show logical rendered-text line numbers; soft wraps keep one number.
+    pub fn line_numbers(mut self, show: bool) -> Self {
+        self.line_numbers = show;
+        self
+    }
+    /// Host-owned document colors without changing model or selection state.
+    pub fn text_style(mut self, style: gpui_kit::base::TextViewStyle) -> Self {
+        self.text_style = Some(style);
+        self
     }
 }
 
@@ -81,7 +95,8 @@ impl RenderOnce for BlockEditor {
         let theme = gpui_kit::base::Theme::global(cx);
         // Links are followed by the editor itself (Cmd/Ctrl-click); the shared
         // renderer must never open a URL on its own.
-        let render_cx = RenderContext::from_app(cx).on_link_click(|_, _, _, _| {});
+        let mut render_cx = RenderContext::from_app(cx).on_link_click(|_, _, _, _| {});
+        if let Some(text_style) = self.text_style { render_cx = render_cx.with_style(text_style); }
         let text_style = render_cx.style().clone();
         let mut style = self.state.read(cx).style.resolved(&theme.tokens);
         if style.selection_is_default() {
@@ -115,10 +130,26 @@ impl RenderOnce for BlockEditor {
                         }
                         _ => range,
                     };
-                    backgrounds
-                        .entry(block.as_u64())
-                        .or_default()
-                        .push((range, style.selection()));
+                    // Text decorations are behind glyphs; inline atoms are
+                    // overlays. Keep images visible even with a solid text selection.
+                    let inline = state.model.doc.inline(block);
+                    let mut cursor = range.start;
+                    if let Some(inline) = inline {
+                        for (atom_range, _, atom) in inline.pieces() {
+                            if atom.is_none() || atom_range.end <= range.start || atom_range.start >= range.end { continue; }
+                            let lo = atom_range.start.max(range.start);
+                            let hi = atom_range.end.min(range.end);
+                            let decorations = backgrounds.entry(block.as_u64()).or_default();
+                            if cursor < lo { decorations.push((cursor..lo, style.selection())); }
+                            decorations.push((lo..hi, style.selection().opacity(0.4)));
+                            cursor = hi;
+                        }
+                    }
+                    if cursor < range.end {
+                        let atomic = matches!(state.model.doc.get(block).map(|e| &e.content), Some(super::document::BlockContent::Atom(_)));
+                        let color = if atomic { style.selection().opacity(0.4) } else { style.selection() };
+                        backgrounds.entry(block.as_u64()).or_default().push((cursor..range.end, color));
+                    }
                 }
                 (
                     state.focus_handle.clone(),
@@ -147,6 +178,22 @@ impl RenderOnce for BlockEditor {
         // before deriving body-relative node metrics and culling geometry.
         let mut typography = window.text_style();
         typography.refine(&self.style.text);
+        // Respect an explicit host line-height for every editable text node.
+        // Kit headings/code have defaults of their own, so inheritance alone
+        // would leave them out of sync with paragraphs and native geometry.
+        let mut render_cx = render_cx;
+        if self.style.text.line_height.is_some() {
+            let font_size = typography.font_size.to_pixels(window.rem_size());
+            let line_height = f32::from(typography.line_height.to_pixels(typography.font_size, window.rem_size()))
+                / f32::from(font_size).max(1.);
+            let base = render_cx.style().clone();
+            let heading_base = base.clone();
+            let code = base.code_block().clone().line_height(gpui::relative(line_height));
+            let cell = base.table_cell().clone().line_height(gpui::relative(line_height));
+            render_cx = render_cx.with_style(base
+                .with_heading(move |level| heading_base.heading(level).line_height(gpui::relative(line_height)))
+                .with_code_block(code).with_table_cell(cell));
+        }
         let node_cx = render_cx
             .with_markdown_extensions(extensions)
             .with_body_font_size(typography.font_size.to_pixels(window.rem_size()));
@@ -317,6 +364,11 @@ impl RenderOnce for BlockEditor {
 
         let content_bounds = Rc::new(Cell::new(Bounds::default()));
         let measured_content = content_bounds.clone();
+        let gutter_width = if self.line_numbers {
+            px(super::gutter::WIDTH)
+        } else {
+            px(0.)
+        };
         let mut root_style = Style::default();
         root_style.refine(&self.style);
         let s = &self.state;
@@ -401,7 +453,7 @@ impl RenderOnce for BlockEditor {
                         .w_full()
                         .refine_style(&self.style)
                         .child(
-                            div().relative().w_full().children(children).child(
+                            div().w_full().pl(gutter_width).child(div().relative().w_full().children(children).child(
                                 canvas(
                                     move |bounds, _, _| measured_content.set(bounds),
                                     |_, _, _, _| {},
@@ -410,7 +462,7 @@ impl RenderOnce for BlockEditor {
                                 .top_0()
                                 .left_0()
                                 .size_full(),
-                            ),
+                            )),
                         )
                         .into_any_element(),
                 ),
@@ -418,6 +470,7 @@ impl RenderOnce for BlockEditor {
                 padding: root_style.padding,
                 typography,
                 caret_was_visible,
+                gutter_width,
                 backgrounds: Some(backgrounds),
                 snapshot,
                 style,
@@ -437,6 +490,7 @@ struct EditorRoot {
     padding: Edges<DefiniteLength>,
     typography: TextStyle,
     caret_was_visible: bool,
+    gutter_width: Pixels,
 }
 
 impl IntoElement for EditorRoot {
@@ -703,6 +757,12 @@ impl Element for EditorRoot {
             // fractional x would blur over two pixels.
             let b = crate::support::snap_caret_to_device_pixels(b, window.scale_factor());
             window.paint_quad(fill(b, style.caret()));
+        }
+        // Draw the read-only number lane last so native selection borders and
+        // drag indicators cannot cut through its labels. The handle strip is
+        // excluded by the gutter's own clip.
+        if self.gutter_width > px(0.) {
+            self.snapshot.line_numbers.paint(&frame, bounds, self.gutter_width, caret, &self.typography, style, window, cx);
         }
         drop(frame);
 

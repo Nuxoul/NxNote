@@ -14,6 +14,7 @@ mod session;
 mod settings_ui;
 mod storage;
 mod theme;
+mod theme_palette;
 mod tray;
 mod watcher;
 
