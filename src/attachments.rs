@@ -1,6 +1,5 @@
-//! Images are external files; document text always contains their real paths.
+//! External image storage and backward-compatible path/filename registry.
 use anyhow::{Context, Result};
-use gpui_kit::component::input::{InlineToken, InputContent};
 use std::{
     collections::BTreeMap,
     io::Cursor,
@@ -65,42 +64,6 @@ impl Attachments {
         );
         self.register(&path, "image.png".into())
     }
-    pub fn token(&self, path: &str) -> InlineToken {
-        InlineToken::new(path.to_string(), path.to_string()).with_label(
-            self.labels.get(path).cloned().unwrap_or_else(|| {
-                Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("image.png")
-                    .into()
-            }),
-        )
-    }
-    pub fn references(&self, text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-        let mut ranges = Vec::new();
-        for path in self.labels.keys() {
-            for (start, _) in text.match_indices(path) {
-                ranges.push((start..start + path.len(), path.clone()));
-            }
-        }
-        ranges.sort_by(|(a, _), (b, _)| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
-        let mut end = 0;
-        ranges.retain(|(range, _)| {
-            if range.start < end { return false; }
-            end = range.end;
-            true
-        });
-        ranges
-    }
-    pub fn content(&self, text: &str) -> InputContent {
-        let mut content = InputContent::new(text.to_string());
-        for (range, path) in self.references(text) {
-            if let Ok(next) = content.clone().with_token(range, self.token(&path)) {
-                content = next;
-            }
-        }
-        content
-    }
 }
 
 pub fn is_image_file(path: &Path) -> bool {
@@ -110,29 +73,4 @@ pub fn is_image_file(path: &Path) -> bool {
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
         )
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn tokens_preserve_source_paths_and_unicode() {
-        let path = r"C:\图片\my image.png";
-        let attachments = Attachments {
-            labels: BTreeMap::from([(path.into(), "my image.png".into())]),
-        };
-        let text = format!("中文 {path} 后文 {path}");
-        let content = attachments.content(&text);
-        assert_eq!(content.text().as_ref(), text);
-        assert_eq!(content.tokens().len(), 2);
-        assert_eq!(content.tokens()[0].token().text().as_ref(), path);
-        assert_eq!(content.tokens()[0].token().label().as_ref(), "my image.png");
-    }
-    #[test]
-    fn ordinary_text_is_not_a_token() {
-        assert!(Attachments::default()
-            .content("image.png 普通文字")
-            .tokens()
-            .is_empty());
-    }
 }

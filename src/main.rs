@@ -5,23 +5,14 @@ mod app;
 mod attachments;
 mod autostart;
 mod config;
-mod document_layout;
-mod editor_support;
 mod fonts;
 mod fsutil;
 mod hotkey;
-mod markdown_edit;
-mod markdown_format;
-mod markdown_extensions;
-mod markdown_renderers;
-mod markdown_projection;
 mod note_editor;
-mod note_links;
 mod platform;
 mod session;
 mod settings_ui;
 mod storage;
-mod source_map;
 mod theme;
 mod tray;
 mod watcher;
@@ -59,6 +50,7 @@ fn main() {
         ))
         .run(move |cx| {
             gpui_kit::init(cx);
+            note_editor::init(cx);
             app::bind_keys(cx);
             if let Err(error) = fonts::install(&cfg, cx) {
                 eprintln!("字体设置无效: {error:#}");

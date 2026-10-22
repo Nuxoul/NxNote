@@ -4,12 +4,10 @@ version = "0.2.1"
 edition = "2021"
 
 [dependencies]
-gpui-kit = { version = "=0.7.3", features = ["tree-sitter-markdown", "tree-sitter-markdown-inline"] }
+gpui-kit = { version = "=0.8.0", features = ["tree-sitter-markdown", "tree-sitter-markdown-inline"] }
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-markdown = "=1.0.0"
-unicode-segmentation = "1"
 toml = "0.8"
 anyhow = "1"
 dirs = "5"
@@ -20,14 +18,7 @@ raw-window-handle = "0.6"
 ttf-parser = "0.25"
 tray-icon = "0.19"
 gpui-reqwest-client = { package = "gpui-pre-reqwest-client", version = "=0.3.9" }
-ratex-parser = "=0.1.9"
-ratex-layout = "=0.1.9"
-ratex-svg = { version = "=0.1.9", features = ["embed-fonts", "standalone"] }
-mermaid-rs-renderer = { version = "=0.3.0", default-features = false }
-resvg = { version = "=0.45.1", default-features = false, features = ["text", "system-fonts"] }
-syntect = { version = "=5.3.0", default-features = false, features = ["default-syntaxes", "regex-fancy", "yaml-load"] }
-sha2 = "=0.10.9"
-ratex-types = "=0.1.14"
+gpui-kit-markdown-editor = { path = "vendor/gpui-kit-markdown-editor", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -36,14 +27,11 @@ winresource = "0.1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_Ime",
     "Win32_UI_Shell",
     "Win32_System_Threading",
-    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
-    "Win32_Graphics_Gdi",
 ] }
 
 [profile.release]

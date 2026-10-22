@@ -53,12 +53,8 @@ actions!(
         ToggleTop,
         ZoomIn,
         ZoomOut,
-        MoveLineUp,
-        MoveLineDown,
-        CopyLineUp,
-        CopyLineDown,
-        DeleteLines,
-        ClearFormatting,
+        MoveBlockUp,
+        MoveBlockDown,
         Tab1,
         Tab2,
         Tab3,
@@ -72,7 +68,6 @@ actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
-    use gpui_kit::base::{input as edit, actions as selection};
     cx.bind_keys([
         KeyBinding::new("ctrl-s", Save, Some("NxNote")),
         KeyBinding::new("ctrl-p", QuickSwitch, Some("NxNote")),
@@ -95,52 +90,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-7", Tab7, Some("NxNote")),
         KeyBinding::new("ctrl-8", Tab8, Some("NxNote")),
         KeyBinding::new("ctrl-9", Tab9, Some("NxNote")),
-        KeyBinding::new("alt-up", MoveLineUp, Some("MarkdownDocument")),
-        KeyBinding::new("alt-down", MoveLineDown, Some("MarkdownDocument")),
-        KeyBinding::new("alt-shift-up", CopyLineUp, Some("MarkdownDocument")),
-        KeyBinding::new("alt-shift-down", CopyLineDown, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-k", DeleteLines, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-a", edit::SelectAll, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-c", edit::Copy, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-x", edit::Cut, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-v", edit::Paste, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-z", edit::Undo, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-y", edit::Redo, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-z", edit::Redo, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-f", edit::Search, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-\\", ClearFormatting, Some("MarkdownDocument")),
-        KeyBinding::new("left", edit::MoveLeft, Some("MarkdownDocument")),
-        KeyBinding::new("right", edit::MoveRight, Some("MarkdownDocument")),
-        KeyBinding::new("up", edit::MoveUp, Some("MarkdownDocument")),
-        KeyBinding::new("down", edit::MoveDown, Some("MarkdownDocument")),
-        KeyBinding::new("shift-left", selection::SelectLeft, Some("MarkdownDocument")),
-        KeyBinding::new("shift-right", selection::SelectRight, Some("MarkdownDocument")),
-        KeyBinding::new("shift-up", selection::SelectUp, Some("MarkdownDocument")),
-        KeyBinding::new("shift-down", selection::SelectDown, Some("MarkdownDocument")),
-        KeyBinding::new("home", edit::MoveHome, Some("MarkdownDocument")),
-        KeyBinding::new("end", edit::MoveEnd, Some("MarkdownDocument")),
-        KeyBinding::new("shift-home", edit::SelectToStartOfLine, Some("MarkdownDocument")),
-        KeyBinding::new("shift-end", edit::SelectToEndOfLine, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-home", edit::MoveToStart, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-end", edit::MoveToEnd, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-home", edit::SelectToStart, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-end", edit::SelectToEnd, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-left", edit::MoveToPreviousWord, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-right", edit::MoveToNextWord, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-left", edit::SelectToPreviousWordStart, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-shift-right", edit::SelectToNextWordEnd, Some("MarkdownDocument")),
-        KeyBinding::new("backspace", edit::Backspace, Some("MarkdownDocument")),
-        KeyBinding::new("delete", edit::Delete, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-backspace", edit::DeleteToPreviousWordStart, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-delete", edit::DeleteToNextWordEnd, Some("MarkdownDocument")),
-        KeyBinding::new("tab", edit::Indent, Some("MarkdownDocument")),
-        KeyBinding::new("shift-tab", edit::Outdent, Some("MarkdownDocument")),
-        KeyBinding::new("enter", edit::Enter { secondary: false, shift: false }, Some("MarkdownDocument")),
-        KeyBinding::new("shift-enter", edit::Enter { secondary: false, shift: true }, Some("MarkdownDocument")),
-        KeyBinding::new("ctrl-enter", edit::Enter { secondary: true, shift: false }, Some("MarkdownDocument")),
-        KeyBinding::new("escape", edit::Escape, Some("MarkdownDocument")),
-        KeyBinding::new("pageup", edit::MovePageUp, Some("MarkdownDocument")),
-        KeyBinding::new("pagedown", edit::MovePageDown, Some("MarkdownDocument")),
+        KeyBinding::new("alt-up", MoveBlockUp, Some("NxNoteEditor")),
+        KeyBinding::new("alt-down", MoveBlockDown, Some("NxNoteEditor")),
     ]);
 }
 
@@ -149,7 +100,6 @@ pub struct NxNoteApp {
     editor: Entity<crate::note_editor::NoteEditor>,
     editor_events: Subscription,
     editor_observer: Subscription,
-    editor_link_events: Subscription,
     save_task: Option<Task<()>>,
     _events: Task<()>,
     _tray: Option<crate::tray::TrayHandle>,
@@ -173,8 +123,6 @@ impl NxNoteApp {
     ) -> Self {
         let editor = Self::make_editor(&session.text, window, cx);
         let (editor_events, editor_observer) = Self::watch_editor(&editor, window, cx);
-        editor.update(cx, |state, cx| state.set_note_context(crate::note_links::NoteLinkContext::from_session(&session), cx));
-        let editor_link_events = Self::watch_note_links(&editor, window, cx);
         let hwnd = match HasWindowHandle::window_handle(window) {
             Ok(handle) => match handle.as_raw() {
                 RawWindowHandle::Win32(h) => h.hwnd.get(),
@@ -252,7 +200,6 @@ impl NxNoteApp {
             editor,
             editor_events,
             editor_observer,
-            editor_link_events,
             save_task: None,
             _events: events,
             _tray: tray,
@@ -291,7 +238,7 @@ impl NxNoteApp {
             editor,
             window,
             |app, editor, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. })
+                if matches!(event, InputEvent::Change | InputEvent::Blur)
                     && !app.replacing
                 {
                     app.session.edit(editor.read(cx).value().to_string());
@@ -310,22 +257,10 @@ impl NxNoteApp {
         (events, observer)
     }
 
-    fn watch_note_links(editor: &Entity<crate::note_editor::NoteEditor>, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
-        cx.subscribe_in(editor, window, |app, editor, event: &crate::note_editor::OpenNoteLink, window, cx| {
-            app.session.edit(editor.read(cx).value().to_string());
-            let target = &event.0;
-            app.switch(OpenTab { folder_key: target.note.folder_key.clone(), note_name: target.note.note_name.clone() }, window, cx);
-            if app.session.current.folder_key == target.note.folder_key && app.session.current.note_name == target.note.note_name {
-                if let Some(heading) = &target.heading { app.editor.update(cx, |editor, cx| editor.jump_to_heading(heading, window, cx)); }
-            }
-        })
-    }
     fn reload_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_task = None;
         self.editor = Self::make_editor(&self.session.text, window, cx);
         (self.editor_events, self.editor_observer) = Self::watch_editor(&self.editor, window, cx);
-        self.editor.update(cx, |state, cx| state.set_note_context(crate::note_links::NoteLinkContext::from_session(&self.session), cx));
-        self.editor_link_events = Self::watch_note_links(&self.editor, window, cx);
         if !self.hidden {
             self.editor.update(cx, |state, cx| state.focus(window, cx));
         }
@@ -465,8 +400,7 @@ impl NxNoteApp {
                         self.replacing = true;
                         self.editor.update(cx, |state, cx| {
                             state.set_value(self.session.text.clone(), window, cx);
-                            let end = self.session.text.len();
-                            state.set_selected_range(end..end, cx);
+                            state.select_end(cx);
                         });
                         self.replacing = false;
                     }
@@ -855,24 +789,16 @@ impl NxNoteApp {
         true
     }
 
-    fn edit_lines(
+    fn move_block(
         &mut self,
-        action: crate::editor_support::LineAction,
+        down: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.editor.focus_handle(cx).is_focused(window) {
             return;
         }
-        let text = self.editor.read(cx).value().to_string();
-        let selection = self.editor.read(cx).selected_range();
-        if let Some((text, selection)) = crate::editor_support::edit_lines(&text, selection, action)
-        {
-            self.editor.update(cx, |state, cx| {
-                state.replace_all(text, window, cx);
-                state.set_selected_range(selection, cx);
-            });
-        }
+        self.editor.update(cx, |state, cx| state.move_block(down, window, cx));
     }
 
 
@@ -890,8 +816,6 @@ impl Render for NxNoteApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_size = cx.theme().font_size;
         _window.set_rem_size(ui_size);
-        let style = theme::document_style(&self.session.cfg, cx);
-        self.editor.update(cx, |editor, _| editor.set_style(style));
         let label = format!(
             "{} / {}",
             self.session.display_name(&self.session.current.folder_key),
@@ -976,16 +900,11 @@ impl Render for NxNoteApp {
             .flex_1()
             .min_h_0()
             .child(self.editor.clone());
-        let cursor = self.editor.read(cx).cursor_position();
+        let status_detail = format!("{} 字 · Markdown 块编辑", self.session.text.chars().count());
         let status = StatusBar::new()
             .text_size(ui_size)
             .left(self.status.clone())
-            .right(format!(
-                "{} 字 · {}:{}",
-                self.session.text.chars().count(),
-                cursor.line + 1,
-                cursor.character + 1
-            ));
+            .right(status_detail);
         let title_visible = !self.session.cfg.autohide_title_bar || self.title_hover;
         div()
             .id("nxnote-main")
@@ -1015,20 +934,11 @@ impl Render for NxNoteApp {
                     app.block_foreground(window, cx)
                 }),
             )
-            .on_action(cx.listener(|app, _: &MoveLineUp, w, c| {
-                app.edit_lines(crate::editor_support::LineAction::MoveUp, w, c)
+            .on_action(cx.listener(|app, _: &MoveBlockUp, window, cx| {
+                app.move_block(false, window, cx)
             }))
-            .on_action(cx.listener(|app, _: &MoveLineDown, w, c| {
-                app.edit_lines(crate::editor_support::LineAction::MoveDown, w, c)
-            }))
-            .on_action(cx.listener(|app, _: &CopyLineUp, w, c| {
-                app.edit_lines(crate::editor_support::LineAction::CopyUp, w, c)
-            }))
-            .on_action(cx.listener(|app, _: &CopyLineDown, w, c| {
-                app.edit_lines(crate::editor_support::LineAction::CopyDown, w, c)
-            }))
-            .on_action(cx.listener(|app, _: &DeleteLines, w, c| {
-                app.edit_lines(crate::editor_support::LineAction::Delete, w, c)
+            .on_action(cx.listener(|app, _: &MoveBlockDown, window, cx| {
+                app.move_block(true, window, cx)
             }))
             .on_action(cx.listener(|app, _: &Quit, window, cx| app.quit(window, cx)))
             .on_action(cx.listener(|app, _: &ToggleTop, window, cx| {

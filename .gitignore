@@ -12,3 +12,7 @@ Thumbs.db
 .DS_Store
 
 .learnings/
+
+# Local release artifacts (keep existing files, never add them to source commits).
+/dist/
+/*-windows-x64.zip
